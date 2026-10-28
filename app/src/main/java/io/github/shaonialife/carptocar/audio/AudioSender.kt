@@ -283,6 +283,7 @@ class AudioSender(
                 return false
             }
             record = recorder
+            consecutiveSendFails = 0
             running.set(true)
             mutePhoneMedia()
             log(
@@ -353,6 +354,7 @@ class AudioSender(
             }
 
             running.set(true)
+            consecutiveSendFails = 0
             // 直通模式不静音手机：音频来源是 CarLife 引擎（它已自行采集并推 PCM），
             // 静音 STREAM_MUSIC 可能破坏引擎的采集源（采集点不确定，不能赌是 REMOTE_SUBMIX）。
             log(
@@ -370,6 +372,21 @@ class AudioSender(
 
     /** 直通模式下的帧对齐累积缓冲（把任意大小的注入 PCM 切成固定帧长）。 */
     private val passthroughBuffer = java.io.ByteArrayOutputStream()
+
+    /** 连续发送失败计数（达到阈值才停流，避免瞬时抖动误杀整条音频）。 */
+    private var consecutiveSendFails = 0
+
+    /**
+     * 连续发送失败达到这个次数才真正停止音频发送。
+     *
+     * 为什么不能「一次失败就停」：媒体（9240）与导航 TTS（9241）**共用同一个 AudioSender**，
+     * 而车机侧在导航接管音频焦点、或 RTP 接收端短暂重协商时会瞬间不读数据，
+     * 于是 `client.send()` 抛 IOException（connected UDP socket 收到 ICMP port-unreachable 后
+     * 下一次 send 失败，或发送缓冲背压）。此时若立刻 `stop()`，整条流被拆——
+     * **音乐和导航会一起没声**，且要等会话重连才恢复。
+     * 这正是「导航播报卡顿几下后，音乐和导航同时消失」的根因。
+     */
+    private val MAX_CONSECUTIVE_SEND_FAILS = 10
 
     /**
      * 直通模式下由外部注入一段 PCM（16bit 交织）。
@@ -491,10 +508,26 @@ class AudioSender(
                     break
                 }
             }
-            if (sendFailed) stop()
+            // 与同步包同一套思路（见 e3325a9）：瞬时失败只重试，连续多次才判定为断流。
+            if (sendFailed) {
+                consecutiveSendFails++
+                if (consecutiveSendFails >= MAX_CONSECUTIVE_SEND_FAILS) {
+                    log("AUDIO: 连续 ${consecutiveSendFails} 次发送失败，停止音频发送（整条流）")
+                    stop()
+                } else {
+                    log("AUDIO: 第 ${consecutiveSendFails} 次发送失败（暂不计为断流，继续重试）")
+                }
+            } else {
+                consecutiveSendFails = 0
+            }
         } catch (error: Throwable) {
-            log("AUDIO: 直通注入异常 - ${error.message}")
-            stop()
+            consecutiveSendFails++
+            if (consecutiveSendFails >= MAX_CONSECUTIVE_SEND_FAILS) {
+                log("AUDIO: 直通注入异常累计 ${consecutiveSendFails} 次 - ${error.message}，停止")
+                stop()
+            } else {
+                log("AUDIO: 直通注入异常（暂不计为断流） - ${error.message}")
+            }
         }
     }
 

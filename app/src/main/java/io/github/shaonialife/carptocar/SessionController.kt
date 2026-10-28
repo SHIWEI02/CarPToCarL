@@ -278,7 +278,8 @@ object SessionController {
             title = info.song.takeIf { it.isNotBlank() },
             artist = info.artist.takeIf { it.isNotBlank() },
             album = info.album.takeIf { it.isNotBlank() },
-            durationMs = info.duration,
+            // CarLife 的 duration 单位是秒（QQ音乐实测 241 = 4:01），iAP2 0x5001 要毫秒
+            durationMs = info.duration * 1000,
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
             elapsedMs = 0,
             appName = info.source.takeIf { it.isNotBlank() },

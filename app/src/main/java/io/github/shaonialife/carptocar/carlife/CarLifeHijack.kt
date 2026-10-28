@@ -115,6 +115,18 @@ object CarLifeHijack {
     private var audioSink: CarLifeAudioSink? = null
 
     /**
+     * 导航 TTS 活跃截止时间（uptimeMillis）。每次收到 TTS PCM 就顺延 [TTS_SUPPRESS_TAIL_MS]；
+     * 媒体通道据此在窗口内丢弃音乐 PCM，实现「导航优先、车端只播导航」。
+     *
+     * @Volatile：TTS 读线程写、媒体读线程读。
+     */
+    @Volatile
+    private var ttsActiveUntil = 0L
+
+    /** 最后一个 TTS 包之后，继续压制音乐这么久（覆盖句内停顿，避免音乐闪回）。 */
+    private const val TTS_SUPPRESS_TAIL_MS = 1500L
+
+    /**
      * TTS（导航播报）专用 sink。
      *
      * 为什么不复用 [audioSink]：TTS 是**独立音频流**（9241 端口），采样率常是 16k 单声道，
@@ -490,7 +502,10 @@ object CarLifeHijack {
                 continue
             }
             announcedWait = false
-            val sink = CarLifeAudioSink(logSink ?: {})
+            val sink = CarLifeAudioSink(
+                logSink ?: {},
+                suppressWhen = { android.os.SystemClock.uptimeMillis() < ttsActiveUntil },
+            )
             audioSink = sink
             // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃（见字段注释）
             val naviSink = CarLifeAudioSink(logSink ?: {}, dropWhenPaused = false)
@@ -510,7 +525,11 @@ object CarLifeHijack {
                 onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
                 // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端
                 onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
-                onTtsPcm = { pcm, size -> routeAudio(naviSink, pcm, size) },
+                onTtsPcm = { pcm, size ->
+                    // 每来一包 TTS 就顺延压制窗口：句内短停顿也保持音乐静默，避免音乐闪回
+                    ttsActiveUntil = android.os.SystemClock.uptimeMillis() + TTS_SUPPRESS_TAIL_MS
+                    routeAudio(naviSink, pcm, size)
+                },
                 onAudioGate = { active -> onEngineAudioGate(active) },
                 onMediaInfo = { info -> onMediaInfo(info) },
                 requestedFps = requestedFps,
@@ -861,11 +880,25 @@ object CarLifeHijack {
         }
     }
 
-    /** 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。 */
+    /**
+     * 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。
+     *
+     * **只在元数据真的变了才广播**：实测（小米 CarLife+ 引擎 + **QQ音乐**）引擎会把
+     * 当前歌词行塞进 field 2 并**逐行**重推 0x10035，一首歌能推 217 次。若不去重，
+     * 每次都会打一条歌名日志并全量补推 0x5001，纯属浪费。
+     * 歌词变化不触发广播——车机侧也没有歌词字段可消费。
+     */
     private fun onMediaInfo(info: CarLifeMediaInfo) {
         latestMediaInfo = info
+        val key = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.size ?: 0}"
+        if (key == lastMediaInfoKey) return
+        lastMediaInfoKey = key
         mediaInfoListeners.forEach { runCatching { it(info) } }
     }
+
+    /** 上一次广播的媒体信息指纹（见 [onMediaInfo] 的去重说明）。 */
+    @Volatile
+    private var lastMediaInfoKey: String? = null
 
     // ---- 触控回传（车机 → 手机）----
 
