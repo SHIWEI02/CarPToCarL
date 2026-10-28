@@ -159,6 +159,38 @@ object CarLifeHijack {
     @Volatile
     private var logSink: ((String) -> Unit)? = null
 
+    // ---- 音频互斥路由：TTS（导航播报）让路 ----
+
+    /**
+     * 最近一次收到 TTS PCM 的时刻。媒体喂入在此后 [TTS_HOLD_MS] 内一律让路。
+     *
+     * 为什么需要互斥（2026-10-28，真车实测）：媒体（9240）与 TTS（9241）若同时喂给
+     * 同一个 `AudioSender`，`feedPcm` 会把两路样本**串接**进同一个 `passthroughBuffer`
+     * ——而 RTP 时间戳是按样本数递增的（`timestamp += samplesPerPacket`），两路叠加
+     * 等于「音频时钟跑两倍」，车机侧按样本时钟排播 → 缓冲被抽空 → 卡顿；持续一段时间
+     * 后 `dispatchPcm` 的 `if (sendFailed) stop()` 触发，**音乐与导航一起静音**。
+     *
+     * 互斥后任一时刻只有一路在喂，样本时钟与真实时长一致，时间轴天然正确。
+     */
+    @Volatile
+    private var ttsLastPacketAt = 0L
+
+    /** TTS 让路期间被丢弃的媒体字节数（诊断用，限频打印后清零）。 */
+    @Volatile
+    private var mediaYieldedBytes = 0L
+
+    @Volatile
+    private var lastTtsYieldLog = 0L
+
+    /**
+     * TTS 最后一包之后继续保持媒体静默的时长。
+     *
+     * 取 700ms 而不是「来一包算一包」：导航播报有句子/路名之间的停顿，
+     * 若间隙里放音乐进来会立刻被打断，听感比连续静音更碎。700ms 覆盖常见句间停顿，
+     * 又不至于让播报结束后音乐迟迟不回来。
+     */
+    private const val TTS_HOLD_MS = 700L
+
     /** 车机通告的视图尺寸（触摸报文坐标系），由会话建立时写入。 */
     @Volatile
     private var viewW = 0
@@ -347,6 +379,9 @@ object CarLifeHijack {
         observedMaxX = 0
         observedMaxY = 0
         hasVideo = false
+        ttsLastPacketAt = 0L
+        mediaYieldedBytes = 0L
+        lastTtsYieldLog = 0L
         lastSourceFrameAt = 0L
         stallSince = 0L
         requestedFps = context
@@ -454,6 +489,10 @@ object CarLifeHijack {
         slot1Down = false
         multiActive = false
         multiMoves = 0
+        // 让路状态必须随会话清空：否则下次连接的前 700ms 媒体会被上一轮的 TTS 时间戳误挡
+        ttsLastPacketAt = 0L
+        mediaYieldedBytes = 0L
+        lastTtsYieldLog = 0L
         worker?.interrupt()
         worker = null
         logSink = null
@@ -508,9 +547,10 @@ object CarLifeHijack {
                 onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
                 onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
                 onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
-                // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端
+                // 导航播报：TTS 通道独立格式、独立 sink；isTts=true 享最高优先级，
+                // 播报期间媒体让路（两路同时喂会把 RTP 时间戳推成两倍速）
                 onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
-                onTtsPcm = { pcm, size -> routeAudio(naviSink, pcm, size) },
+                onTtsPcm = { pcm, size -> routeAudio(naviSink, pcm, size, isTts = true) },
                 onAudioGate = { active -> onEngineAudioGate(active) },
                 onMediaInfo = { info -> onMediaInfo(info) },
                 requestedFps = requestedFps,
@@ -838,14 +878,38 @@ object CarLifeHijack {
      *
      * 本次连接若没勾「开启声音」，AirPlay 音频流不存在，本地播放只会从手机喇叭
      * 外放（用户不想要、也白耗电），所以直接丢弃并限频提示。
+     *
+     * 另外做**媒体 / TTS 互斥**：TTS（导航播报）有数据时媒体让路，保证任一时刻
+     * 只有一路喂给 `AudioSender`——两路同时喂会把 RTP 时间戳推成两倍速（见 [ttsLastPacketAt]）。
+     *
+     * @param isTts true = 这是导航播报通道（9241）的 PCM，享最高优先级
      */
     private fun routeAudio(
         sink: CarLifeAudioSink,
         pcm: ByteArray,
         size: Int,
+        isTts: Boolean = false,
     ) {
         val routed = io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true
         if (routed) {
+            val now = android.os.SystemClock.uptimeMillis()
+            if (isTts) {
+                ttsLastPacketAt = now
+                sink.write(0, 0, pcm, size)
+                return
+            }
+            // 媒体：播报期（含尾部保持窗）让路，避免两路样本串接导致时间轴翻倍
+            if (now - ttsLastPacketAt < TTS_HOLD_MS) {
+                mediaYieldedBytes += size
+                if (now - lastTtsYieldLog >= AUDIO_DROP_LOG_MS) {
+                    lastTtsYieldLog = now
+                    logSink?.invoke(
+                        "CARLIFE: 导航播报中——媒体暂让路（累计 ${mediaYieldedBytes / 1024}KB），播完自动恢复",
+                    )
+                    mediaYieldedBytes = 0
+                }
+                return
+            }
             sink.write(0, 0, pcm, size)
             return
         }
