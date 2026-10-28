@@ -283,6 +283,7 @@ class AudioSender(
                 return false
             }
             record = recorder
+            consecutiveSendFails = 0
             running.set(true)
             mutePhoneMedia()
             log(
@@ -353,6 +354,7 @@ class AudioSender(
             }
 
             running.set(true)
+            consecutiveSendFails = 0
             // 直通模式不静音手机：音频来源是 CarLife 引擎（它已自行采集并推 PCM），
             // 静音 STREAM_MUSIC 可能破坏引擎的采集源（采集点不确定，不能赌是 REMOTE_SUBMIX）。
             log(
@@ -370,6 +372,12 @@ class AudioSender(
 
     /** 直通模式下的帧对齐累积缓冲（把任意大小的注入 PCM 切成固定帧长）。 */
     private val passthroughBuffer = java.io.ByteArrayOutputStream()
+
+    /** 连续发送失败计数（达到阈值才停流，避免瞬时抖动误杀整条音频）。 */
+    private var consecutiveSendFails = 0
+
+    /** 连续发送失败达到这个次数才停止音频发送（瞬时 1~2 次失败通常是车机 RTP 短暂不读，应重试）。 */
+    private val MAX_CONSECUTIVE_SEND_FAILS = 10
 
     /**
      * 直通模式下由外部注入一段 PCM（16bit 交织）。
@@ -491,10 +499,25 @@ class AudioSender(
                     break
                 }
             }
-            if (sendFailed) stop()
+            if (sendFailed) {
+                consecutiveSendFails++
+                if (consecutiveSendFails >= MAX_CONSECUTIVE_SEND_FAILS) {
+                    log("AUDIO: 连续 ${consecutiveSendFails} 次发送失败，停止音频发送（整条流）")
+                    stop()
+                } else {
+                    log("AUDIO: 第 ${consecutiveSendFails} 次发送失败（暂不计为断流，继续重试）")
+                }
+            } else {
+                consecutiveSendFails = 0
+            }
         } catch (error: Throwable) {
-            log("AUDIO: 直通注入异常 - ${error.message}")
-            stop()
+            consecutiveSendFails++
+            if (consecutiveSendFails >= MAX_CONSECUTIVE_SEND_FAILS) {
+                log("AUDIO: 直通注入异常累计 ${consecutiveSendFails} 次 - ${error.message}，停止")
+                stop()
+            } else {
+                log("AUDIO: 直通注入异常（暂不计为断流） - ${error.message}")
+            }
         }
     }
 

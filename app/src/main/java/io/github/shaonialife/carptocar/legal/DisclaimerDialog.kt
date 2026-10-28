@@ -19,16 +19,16 @@ import io.github.shaonialife.carptocar.ui.PanelWindow
  * 免责声明弹窗（两种形态）：
  *
  * - **首次启动（强制）**：不可取消（返回键/外部点击都无效），「接受」需同时满足
- *   10 秒倒计时与「已滑到底」；「放弃使用」立即可点（拒绝不该被阻拦）。
+ *   3 秒倒计时与「已滑到底」；「放弃使用」立即可点（拒绝不该被阻拦）。
  * - **菜单重看（只读）**：无倒计时、无滚动要求，一个「关闭」按钮。
  *
  * 倒计时用**绝对截止时间**（[SystemClock.elapsedRealtime]）而不是递减计数：
  * 屏幕旋转导致 Activity 重建时，把 deadline 透传回来即可继续剩余时间，
- * 不会从头再等 10 秒。
+ * 不会从头再等 3 秒。
  */
 object DisclaimerDialog {
     /** 强制接受前的最短停留时间。 */
-    const val COUNTDOWN_MS = 10_000L
+    const val COUNTDOWN_MS = 3_000L
 
     private const val WINDOW_HEIGHT_FRACTION = 0.78f
 

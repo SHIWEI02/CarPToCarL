@@ -259,6 +259,7 @@ object SessionController {
      */
     private fun buildNowPlaying(): CarPlayNowPlaying? {
         val session = MediaSessionsState.nowPlaying
+        probeArtwork(session?.art, CarLifeHijack.latestMediaInfo?.albumArt)
         if (session != null && session.title != null) {
             return CarPlayNowPlaying(
                 title = session.title,
@@ -278,11 +279,42 @@ object SessionController {
             title = info.song.takeIf { it.isNotBlank() },
             artist = info.artist.takeIf { it.isNotBlank() },
             album = info.album.takeIf { it.isNotBlank() },
-            durationMs = info.duration,
+            // CarLife 的 duration 单位是秒（实测 241 = 4:01），iAP2 0x5001 要毫秒
+            durationMs = info.duration * 1000,
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
             elapsedMs = 0,
             appName = info.source.takeIf { it.isNotBlank() },
         )
+    }
+
+    /** 封面侦察日志节流（同一结论 30 秒内不重复刷屏）。 */
+    private var lastArtProbeAt = 0L
+    private var lastArtProbeKey: String? = null
+
+    /**
+     * 封面侦察（**只记日志，不改协议**）。
+     *
+     * 为什么先只侦察：CarPlay 主屏本身就是视频流（Apple WWDC16-723），封面本来就以
+     * 像素形式出现在镜像画面里；只有**仪表盘 / HUD** 需要结构化封面，而那条路走
+     * iAP2 **文件传输会话**（作者协议笔记：「后续可注入 file-transfer 0x0C，仪表盘
+     * 封面要用」），本版本尚未实现。这里先坐实「封面拿不拿得到、多大」，为接入
+     * file-transfer 提供依据——拿不到就没必要做传输层。
+     */
+    private fun probeArtwork(
+        sessionArt: android.graphics.Bitmap?,
+        carLifeArt: ByteArray?,
+    ) {
+        val desc =
+            when {
+                sessionArt != null -> "MediaSession ${sessionArt.width}x${sessionArt.height}"
+                carLifeArt != null -> "CarLife ${carLifeArt.size}B"
+                else -> "无封面"
+            }
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (desc == lastArtProbeKey && now - lastArtProbeAt < 30_000L) return
+        lastArtProbeKey = desc
+        lastArtProbeAt = now
+        appendLog("COVER: 封面侦察 → $desc")
     }
 
     /** 追加一行日志：logcat + 文件 + 进程级缓冲 + 挂屏渲染（增量行直送）。任意线程可调。 */

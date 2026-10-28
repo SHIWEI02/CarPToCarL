@@ -124,6 +124,10 @@ class CarLifeHuClient(
     @Volatile
     private var versionMatched = false
 
+    /** 媒体信息解析失败时的 hex 诊断节流计数/时间戳（诊断用，见 MD_MEDIA_INFO 分支）。 */
+    private var mediaInfoHexPrinted = 0
+    private var lastMediaInfoHexAt = 0L
+
     /**
      * 视频通道（9242）是否已失效。
      *
@@ -536,15 +540,25 @@ class CarLifeHuClient(
             CarLifeProtocol.MD_MEDIA_INFO -> {
                 // 手机 CarLife 内置播放器开始播放时主动推送的媒体信息（歌名/歌手/封面）
                 val infos = CarLifeProtocol.parseMediaInfoList(payload)
+                // 诊断：把整包的顶层字段清单打出来（不只是头部 64 字节），用于核对
+                // 「字段编号 → 语义」的真实映射。节流：前 5 次 + 之后每 60 秒一次。
+                val now = android.os.SystemClock.elapsedRealtime()
+                if (mediaInfoHexPrinted < 5 || now - lastMediaInfoHexAt > 60_000L) {
+                    mediaInfoHexPrinted++
+                    lastMediaInfoHexAt = now
+                    log(
+                        "CARLIFE: 媒体信息原始字段（${payload.size}B）→ " +
+                            CarLifeProtocol.debugFieldInventory(payload),
+                    )
+                }
                 if (infos.isEmpty()) {
-                    log("CARLIFE: 收到媒体信息（${payload.size}B）但解析为空")
                     return
                 }
                 infos.forEach { info ->
                     log(
-                        "CARLIFE: 媒体信息 song=${info.song} artist=${info.artist} " +
-                            "album=${info.album} dur=${info.duration}ms mode=${info.mode} " +
-                            "art=${info.albumArt?.size ?: 0}B",
+                        "CARLIFE: 媒体信息 歌名=${info.song} 歌手=${info.artist} " +
+                            "专辑=${info.album} 时长=${info.duration}s 封面=${info.albumArt?.size ?: 0}B " +
+                            "歌词=${info.lyric.take(16)}",
                     )
                     onMediaInfo(info)
                 }

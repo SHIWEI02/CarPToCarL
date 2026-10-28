@@ -1,0 +1,14 @@
+[package]
+name = "carplay-probe"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "carplay-probe"
+path = "src/main.rs"
+
+[dependencies]
+nusb = "0.2"
+
+# 独立 crate，不进 MacPlay 的 workspace：只依赖 nusb，几分钟就能编译完，
+# 也不受 Swift UI / GStreamer 那些 Windows 上缺失的部件影响。

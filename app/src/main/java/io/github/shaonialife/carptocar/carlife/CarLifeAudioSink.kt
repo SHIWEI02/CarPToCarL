@@ -26,6 +26,15 @@ internal class CarLifeAudioSink(
      * （2026-10-27 日志：10:35:04 刚触发暂停丢弃，10:35:14 的导航 TTS 就来了）。
      */
     private val dropWhenPaused: Boolean = true,
+    /**
+     * 外部抑制条件（导航 TTS 优先时由 [CarLifeHijack] 注入）。
+     *
+     * 返回 true 时**无条件丢弃**本通道 PCM，不再发给车机。用于「导航播报期间压住音乐」：
+     * 媒体通道（9240）传入「TTS 是否正在活跃」的判定，导航一说话就让车端只听导航，
+     * 避免音乐与导航在共享发送端里争用导致卡顿，也让导航播报更清晰。
+     * TTS 通道（9241）不传这个（传 null），导航自己永不被抑制。
+     */
+    private val suppressWhen: (() -> Boolean)? = null,
 ) {
     /** CarLife 引擎宣告的源采样率（CarlifeMusicInit；<=0 表示尚未宣告，按 48k 处理）。 */
     @Volatile
@@ -42,6 +51,10 @@ internal class CarLifeAudioSink(
     /** 因「音乐会话暂停」被丢弃的包数（诊断用：导航播报被误判暂停时能一眼看出来）。 */
     private var droppedWhenPaused = 0L
     private var lastDropReportAt = 0L
+
+    /** 因「导航 TTS 优先」被丢弃的媒体包数（诊断用）。 */
+    private var droppedByTts = 0L
+    private var lastTtsDropReportAt = 0L
 
     /**
      * 电平统计（跟着 5 秒那条「音频直通」日志一起报）。
@@ -143,6 +156,11 @@ internal class CarLifeAudioSink(
             countDroppedWhenPaused()
             return
         }
+        // 导航 TTS 优先：TTS 活跃窗口内，媒体通道丢音乐 PCM（车端只播导航）
+        if (suppressWhen?.invoke() == true) {
+            countDroppedByTts()
+            return
+        }
         if (srcRate <= 0) {
             configure(
                 if (sampleRate > 0) sampleRate else DEFAULT_RATE,
@@ -184,6 +202,8 @@ internal class CarLifeAudioSink(
         lastReportAt = 0
         droppedWhenPaused = 0
         lastDropReportAt = 0
+        droppedByTts = 0
+        lastTtsDropReportAt = 0
         pauseWindowExpiredLogged = false
         pausedSince = 0L
         peakSinceReport = 0
@@ -210,6 +230,24 @@ internal class CarLifeAudioSink(
         log("CARLIFE: 暂停期间丢弃 ${droppedWhenPaused} 包 PCM（若此时本应有导航/媒体声音，说明会话状态被误判）")
         droppedWhenPaused = 0
         lastDropReportAt = now
+    }
+
+    /**
+     * 「导航 TTS 优先」的诊断计数：媒体通道在 TTS 活跃窗口内丢弃的音乐 PCM。
+     *
+     * 每 30 秒记一条，导出日志时可直接确认「导航期间车端是否真的只播导航、音乐被压住」。
+     */
+    private fun countDroppedByTts() {
+        droppedByTts++
+        val now = android.os.SystemClock.uptimeMillis()
+        if (lastTtsDropReportAt == 0L) {
+            lastTtsDropReportAt = now
+            return
+        }
+        if (now - lastTtsDropReportAt < DROP_REPORT_INTERVAL_MS) return
+        log("CARLIFE: 导航 TTS 优先——丢弃 ${droppedByTts} 包音乐 PCM（车端只播导航）")
+        droppedByTts = 0
+        lastTtsDropReportAt = now
     }
 
     private fun reportIfDue() {

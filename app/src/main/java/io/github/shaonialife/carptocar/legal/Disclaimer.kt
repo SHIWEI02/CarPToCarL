@@ -52,7 +52,7 @@ object DisclaimerPrefs {
  * 3. （由调用方保证）用户未点「放弃使用」。
  *
  * 注意：倒计时与滚动是**并列**条件，不是串行——否则长文案用户滑 30 秒后
- * 还要再等 10 秒，体验很差。
+ * 还要再等 3 秒，体验很差。
  */
 internal fun canAcceptDisclaimer(
     countdownDone: Boolean,
