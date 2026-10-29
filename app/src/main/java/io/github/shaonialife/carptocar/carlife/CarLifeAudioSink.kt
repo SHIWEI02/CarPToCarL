@@ -163,8 +163,19 @@ internal class CarLifeAudioSink(
             countDroppedWhenPaused()
             return
         }
-        // 导航 TTS 优先：TTS 活跃窗口内，媒体通道丢音乐 PCM（车端只播导航）
+        // 导航 TTS 优先：TTS 活跃窗口内，媒体通道写**等长静音**而不是丢包。
+        // 判断逻辑（suppressWhen / ttsActiveUntil）来自 fix/audio-tts-and-media-metadata，
+        // 执行动作改为静音占位（6b1638b）：直接丢弃会让 RTP 时间戳少推进整整一段，
+        // 播报结束从断点接上 = 时间轴跳变，正是「导航开头几句卡顿」的来源。
         if (suppressWhen?.invoke() == true) {
+            // 先保证源格式已知，否则静音会按默认 48k 喂入，与实际不符
+            if (srcRate <= 0) {
+                configure(
+                    if (sampleRate > 0) sampleRate else DEFAULT_RATE,
+                    if (channels > 0) channels else 2,
+                )
+            }
+            writeSilence(size)
             countDroppedByTts()
             return
         }
