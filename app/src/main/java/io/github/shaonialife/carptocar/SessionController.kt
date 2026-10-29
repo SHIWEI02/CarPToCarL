@@ -845,6 +845,20 @@ object SessionController {
             // 1) WLAN 开关。shell 不可用时跳过检查——requestNetwork 会以 Unavailable 反馈。
             if (shellReady && shellWifiDisabled() && !waitForWifiEnabled()) return@run
             if (connectCancelled) return@run
+            // 1.4) 快路径（2026-10-29 实机）：**已经连在目标 SSID 上**就直接绑定，
+            // 不要再发起 WifiNetworkSpecifier——Android 不允许对同一 SSID 建第二条
+            // 并发链路，specifier 会立刻 onUnavailable，然后拖满 15s 超时报
+            // 「应用专属网络加入未成功」。实测：手机连着家用 Mltech，0x5703 下发的
+            // 恰好也是 Mltech，spec
+            // ifier 每轮被拒、会话卡死、AirPlay 永远起不来。
+            // 用 WifiManager 读当前 SSID（本应用已有 ACCESS_FINE_LOCATION），
+            // 不依赖 shell 特权——SysShell 是普通 sh -c，cmd wifi status 必失败。
+            val currentSsid = currentWifiSsid()
+            if (currentSsid != null && currentSsid == wifi.ssid) {
+                appendLog("WIFI: 已在目标热点 \"$currentSsid\"——跳过加入，直接绑定")
+                bindCarWifiAndRegister(wifi.ssid)
+                return@run
+            }
             // 1.5) 登记 WiFi 建议（幂等）：用户授权过一次后，系统会自己把手机连上
             // 车机热点，后续不再出现「连接到此网络？」确认框——这是无人点屏场景的
             // 唯一可行路径（BMW iD9 只给 27s，人来不及点就断链）。
@@ -1291,6 +1305,18 @@ object SessionController {
             }
         }
     }
+
+    /** 当前已连接 WiFi 的 SSID（WifiManager；需 ACCESS_FINE_LOCATION，已声明）。未连接返回 null。 */
+    private fun currentWifiSsid(): String? =
+        try {
+            val wm = appContext?.getSystemService(android.content.Context.WIFI_SERVICE) as? android.net.wifi.WifiManager
+            val raw = wm?.connectionInfo?.ssid ?: return null
+            // WifiManager 返回值带双引号：`"Mltech"`；`<unknown ssid>` 表示拿不到
+            val trimmed = raw.trim('"')
+            if (trimmed.isEmpty() || trimmed == "<unknown ssid>") null else trimmed
+        } catch (e: SecurityException) {
+            null
+        }
 
     /**
      * WiFi 开关与当前连接的 SSID（一次 `cmd wifi status` 查询）。
