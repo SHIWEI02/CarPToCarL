@@ -1593,10 +1593,22 @@ class AirPlayClient(
         const val AUDIO_TYPE_MEDIA = "media"
 
         /**
-         * 音频延迟兜底值（ms）：车机 /info 的 audioLatencies 里没给 outputLatencyMicros 时用。
-         * catplay 注释：AirPlay 推流最低 250ms 才稳定（clamp 32..2000）——兜底取 250。
+         * 音频延迟兜底值（ms）：车机 /info 的 audioLatencies 里没给 outputLatencyMicros 时用，
+         * 同时也作为 `latencyFor()` 的**下限**（coerceAtLeast）。
+         *
+         * 2026-10-29 从 250 提到 500。依据：
+         *  - 业界无线 CarPlay 适配器（CarLinkit/Ottocast）的 Media Delay 默认 **1000ms**，
+         *    可调 300–2000，官方说法是「数值越大越不容易卡」；
+         *  - MacPlay 的 cpStack 注释：真 iPhone 请求的 audioLatencyMs 就是 **1000**
+         *    （`latencyMs: audioLatencyMs > 0 ? audioLatencyMs : 1000`）；
+         *  - 本项目实测 250ms 时 `playoutLeadMs` 只剩 16.9ms（不到一包），
+         *    `averageJitterMs` 20.2ms 已逼近余量，偶发欠载。
+         *
+         * 没有直接拉到 1000 是因为本链路是「CarLife 转义 → CarPlay」，本身比原生多一层
+         * 转发，延迟会叠加；再拉到 1000 会让音画不同步变得明显。500 是折中：
+         * 缓冲余量翻倍，额外延迟仍在一包量级。
          */
-        const val AUDIO_LATENCY_FALLBACK_MS = 250L
+        const val AUDIO_LATENCY_FALLBACK_MS = 500L
 
         /** 车机音量 ≤ 这个值（dB）视为静音位（AirPlay 里 -144 约等于全静音）。 */
         private const val MUTE_THRESHOLD_DB = -100f

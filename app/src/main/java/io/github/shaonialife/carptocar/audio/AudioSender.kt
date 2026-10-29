@@ -66,6 +66,17 @@ class AudioSender(
      * 见 [AudioProfile.channels] 的说明。
      */
     private val channels: Int = CHANNELS,
+    /**
+     * OPUS 目标码率（bps），仅 [AudioCodec.OPUS] 生效。
+     *
+     * Apple 自己的低延迟流码率档位（MacPlay `cpStack.js` 记录）：
+     *   ≤24kHz → 48kbps，≤32kHz → 64kbps，**48kHz → 96kbps**
+     *
+     * 2026-10-29 从 24k 提到 96k：48kHz fullband 模式要编码 0–20kHz 带宽，
+     * 24kbps 摊下去语音频段严重不足，编码器被迫大量丢细节——表现正是
+     * 「包没丢、抖动 1.26ms、解码 100%，但听起来断续」。96k 仍只有 PCM 的 1/16。
+     */
+    private val opusBitRate: Int = 96_000,
 ) {
     companion object {
         const val CHANNELS = 2
@@ -141,6 +152,76 @@ class AudioSender(
     @Volatile private var timestamp = 0L
 
     @Volatile private var nonceCounter = 0L
+
+    /**
+     * 抗成像低通的跨包状态：每声道两级 biquad 各 2 个状态变量。
+     * 必须跨包保持，否则包边界不连续会产生规律性咔哒声。
+     */
+    private val antiImageState = Array(channels) { DoubleArray(4) }
+
+    /** 当前低通截止频率（按源采样率缓存；变化时重算系数并清状态）。 */
+    private var antiImageFc = 0.0
+
+    /** 当前低通系数 `[b0, b1, b2, a1, a2]`，null = 还没算过。 */
+    private var antiImageCoeffs: DoubleArray? = null
+
+    /** 滤波器状态被重置的次数（>1 说明源采样率在变，会引入瞬态咔哒）。 */
+    private var filterResets = 0
+
+    // ---- 诊断（2026-10-29）：定位「卡顿 + 沙沙」----
+    /** 喂入次数 / 成功发包数 / 源包间隔统计。 */
+    private var fedCount = 0
+    private var sentCount = 0
+    private var lastFeedAt = 0L
+    private var gapSum = 0L
+    private var gapMax = 0L
+    private var gapCount = 0
+
+    /** 音频落盘（白盒分析用）：settings.debug_dump_audio = true 时把源与上采样后 PCM 写文件。 */
+    private val dumpEnabled: Boolean by lazy {
+        context?.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+            ?.getBoolean("debug_dump_audio", false) ?: false
+    }
+    private var dumpSeq = 0
+
+    /**
+     * 发送均匀化开关（settings.audio_pacing_enabled，默认 true）。
+     *
+     * 背景：CarLife 一次送一大块（TTS 一包 = 4 个 Opus 帧），原来连着发，
+     * 接收端抖动检测会判超窗。均匀化按每帧时长放行，实测把 jitterLost 从 9 降到 0。
+     *
+     * 但它是在 dispatchPcm → sendPayload 路径上 sleep，会**阻塞喂数据的线程**。
+     * 若上游持续快于实时，延迟会累积。留这个开关便于对比「有/无均匀化」的听感。
+     */
+    private val pacingEnabled: Boolean by lazy {
+        context?.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+            ?.getBoolean("audio_pacing_enabled", true) ?: true
+    }
+
+    private fun dumpPcm(tag: String, data: ByteArray, size: Int) {
+        if (!dumpEnabled || dumpSeq >= 80) return
+        val dir = context?.getExternalFilesDir(null) ?: return
+        try {
+            java.io.File(dir, "tts-$tag-$dumpSeq.bin")
+                .writeBytes(if (size == data.size) data else data.copyOf(size))
+        } catch (_: Throwable) {
+            // 落盘失败不影响播放
+        }
+    }
+
+    /**
+     * 下一包的「理论发送时刻」（uptimeMillis），用于**发送均匀化**。
+     *
+     * 为什么需要（2026-10-29 MacPlay 实测）：CarLife 送来的音频是**大块**——
+     * 一包导航 TTS = 2560B = 80ms 音频，重采样后正好 4 个 Opus 帧；媒体也常几帧
+     * 一起到。直通路径原来一拿到就 `for (payload) send()` 连发，4 个 UDP 包间隔≈0，
+     * 而它们的 RTP 时间戳各差 20ms。接收端抖动缓冲按「包间隔」排播，瞬时突发会被
+     * 判超窗丢弃：实测 Opus jitterLost=9/3367、AAC jitterLost=22/27381。
+     *
+     * 现在按每包的真实时长（samplesPerPacket / sampleRate）均匀放行，
+     * 接收端看到的就是稳定节奏。0 = 尚未起锚。
+     */
+    private var nextSendAt = 0L
 
     /** 首个音频包标记（打完就清）；AAC 自检只跑一次。 */
     private var markerPending = true
@@ -369,9 +450,8 @@ class AudioSender(
                 }
                 aacEncoder = encoder
             } else if (codec == AudioCodec.OPUS) {
-                // 导航语音 24kbps 足够（MacPlay 建议 tier：≤24kHz 用 48kbps，
-                // 但那是给音乐/麦克风的；语音提示 24kbps 清晰度已超出 16k 源的上限）
-                val encoder = OpusEncoder(sampleRate, bitRate = 24_000, log = log)
+                // 码率对齐 Apple 48kHz 档位（96kbps），见 [opusBitRate] 的说明。
+                val encoder = OpusEncoder(sampleRate, bitRate = opusBitRate, log = log)
                 if (!encoder.start()) {
                     client.close()
                     socket = null
@@ -429,7 +509,21 @@ class AudioSender(
     ) {
         if (!running.get() || record != null) return // 采集模式在跑时不接受注入
         if (size <= 0) return
+        // 诊断：源包到达节奏。TTS 一包 2560B@16k = 80ms，理想间隔就是 ~80ms；
+        // 间隔忽大忽小说明「卡顿」来自 CarLife 源而不是我们的编码/发送。
+        val nowAt = android.os.SystemClock.uptimeMillis()
+        if (lastFeedAt > 0L) {
+            val gap = nowAt - lastFeedAt
+            gapSum += gap
+            gapCount++
+            if (gap > gapMax) gapMax = gap
+        }
+        lastFeedAt = nowAt
+        fedCount++
+        dumpPcm("src", srcPcm, size)
         val resampled = alignPcm(srcPcm, size, srcRate, srcChannels) ?: return
+        dumpPcm("dst", resampled, resampled.size)
+        dumpSeq++
         // 累积到固定帧长，凑满一帧才发（PCM 通路逐包、AAC 通路逐帧）
         val frameBytes = framePcmBytes
         passthroughBuffer.write(resampled, 0, resampled.size)
@@ -512,7 +606,97 @@ class AudioSender(
                 out[dst + 1] = ((v shr 8) and 0xFF).toByte()
             }
         }
+
+        // 抗成像低通（仅上采样路径）。
+        //
+        // 源带宽只到 inRate/2。线性插值把采样率抬到 sampleRate 后，inRate/2 之上
+        // 会复制出镜像——线性插值核是三角窗，频响 sinc²，16k→48k 时 8kHz 处只
+        // 衰减 3.5dB、10kHz 处 5dB，衰减远远不够，听感是持续的「沙沙」高频噪声。
+        //
+        // 2026-10-29 实测链条：24kbps 时 Opus 把这些高频当噪声大量丢弃，杂音被
+        // 掩盖（代价是发闷）；提到 96kbps 后编码器忠实保留，杂音立刻暴露。而
+        // MacPlay 侧 packets=580 / decoded=580 / pipelineErrors=0 / invalid=0
+        // —— 传输与解码全干净，问题只能在编码前的数据本身。
+        //
+        // 两级 Butterworth 二阶低通（合计 4 阶、-24dB/oct）在 0.45×inRate 处切。
+        // 实测：8–12kHz 镜像相对语音核心 -54.6dB，已在掩蔽阈值以下。
+        if (inRate < sampleRate) {
+            val fc = inRate * 0.45
+            if (fc != antiImageFc) {
+                antiImageFc = fc
+                antiImageCoeffs = lowpassCoeffs(fc)
+                // 源采样率变了（切换音源），状态清零避免残留瞬态
+                for (st in antiImageState) st.fill(0.0)
+                // 显式记一行，免得「到底有没有走滤波」只能靠猜。
+                // 同时记录重置次数：若 fc 频繁变化（源采样率抖动），状态会被反复
+                // 清零，每次清零都是一次瞬态——那是可闻的「咔哒」。
+                filterResets++
+                log(
+                    "AUDIO-FILTER[$streamType]: 抗成像低通 fc=${fc.toInt()}Hz " +
+                        "（${inRate}Hz → ${sampleRate}Hz）第 $filterResets 次重置",
+                )
+            }
+            applyAntiImage(out)
+        }
         return out
+    }
+
+    /**
+     * 按截止频率算两级 Butterworth 二阶低通系数。
+     * 返回 `[b0, b1, b2, a1, a2]`，已按 a0 归一化（Q = 1/√2 即 Butterworth）。
+     */
+    private fun lowpassCoeffs(fc: Double): DoubleArray {
+        val w0 = 2.0 * Math.PI * fc / sampleRate
+        val cosW = Math.cos(w0)
+        val alpha = Math.sin(w0) / (2.0 * 0.70710678)
+        val a0 = 1.0 + alpha
+        val b0 = (1.0 - cosW) / 2.0 / a0
+        val b1 = (1.0 - cosW) / a0
+        return doubleArrayOf(b0, b1, b0, -2.0 * cosW / a0, (1.0 - alpha) / a0)
+    }
+
+    /**
+     * 两级串联 biquad 低通，原地处理 16bit 小端交错 PCM。
+     *
+     * 状态存在 [antiImageState]（每声道 4 个变量，2 级 biquad），**跨包保持**——每包重置会在
+     * 包边界产生不连续，听感是规律性的「咔哒」。
+     */
+    private fun applyAntiImage(out: ByteArray) {
+        val c = antiImageCoeffs ?: return
+        val b0 = c[0]
+        val b1 = c[1]
+        val b2 = c[2]
+        val a1 = c[3]
+        val a2 = c[4]
+        val bytesPerFrame = channels * 2
+        val frames = out.size / bytesPerFrame
+        for (f in 0 until frames) {
+            for (ch in 0 until channels) {
+                val idx = f * bytesPerFrame + ch * 2
+                if (idx + 1 >= out.size) continue
+                var x = ((out[idx].toInt() and 0xFF) or (out[idx + 1].toInt() shl 8)).toShort().toDouble()
+                val st = antiImageState[ch]
+                // 第一级
+                var y = b0 * x + st[0]
+                st[0] = b1 * x - a1 * y + st[1]
+                st[1] = b2 * x - a2 * y
+                // 第二级
+                x = y
+                y = b0 * x + st[2]
+                st[2] = b1 * x - a1 * y + st[3]
+                st[3] = b2 * x - a2 * y
+                // 只做两级（4 阶）。
+                //
+                // 2026-10-29 回退记录：一度加到三级（6 阶，理论抑制 -66dB），
+                // 数值验证完全干净（4 阶峰值 29741 / 6 阶 29759，均无削波，
+                // 与真实 dump 逐样本差异 <2），但实测体感反而更差。
+                // 既然 4 阶的 -54.6dB 已在语音掩蔽阈值以下，就保持 4 阶：
+                // 理论余量换不来听感，少一级也少一半计算。
+                val v = y.toInt().coerceIn(-32768, 32767)
+                out[idx] = (v and 0xFF).toByte()
+                out[idx + 1] = ((v shr 8) and 0xFF).toByte()
+            }
+        }
     }
 
     /** 读取 16bit 小端样本（越界返回 0，避免尾部插值越界）。 */
@@ -549,7 +733,20 @@ class AudioSender(
                     break
                 }
             }
+            if (!sendFailed) sentCount += payloads.size
             if (sendFailed) stop()
+            // 每 50 次喂入输出一行诊断（约 4 秒一次）
+            if (fedCount % 50 == 0 && fedCount > 0) {
+                val avgGap = if (gapCount > 0) gapSum / gapCount else 0L
+                val encStats = opusEncoder?.stats() ?: "-"
+                log(
+                    "AUDIO-DIAG[$streamType]: 喂入 $fedCount 包 / 已发 $sentCount 包 · " +
+                        "源间隔 平均 ${avgGap}ms 最大 ${gapMax}ms · 编码器 $encStats",
+                )
+                gapSum = 0
+                gapMax = 0
+                gapCount = 0
+            }
         } catch (error: Throwable) {
             log("AUDIO: 直通注入异常 - ${error.message}")
             stop()
@@ -799,6 +996,28 @@ class AudioSender(
 
     /** 封包 + 发送一包（同步更新 seq/ts/nonce 游标）。返回 false 表示链路已断。 */
     private fun sendPayload(payload: ByteArray): Boolean {
+        // 发送均匀化（仅直通模式生效）：把「一次到一大块」摊平成按帧时长的稳定节奏。
+        // 采集模式（record != null）的音频源本身就是实时的，节流等于白加延迟。
+        if (record == null && running.get() && pacingEnabled) {
+            val intervalMs = (samplesPerPacket * 1_000L / sampleRate).coerceAtLeast(1L)
+            val now = android.os.SystemClock.uptimeMillis()
+            if (nextSendAt == 0L) nextSendAt = now
+            val wait = nextSendAt - now
+            // 单次最多等 40ms：万一上游持续快于实时（缓冲积压），宁可牺牲一点均匀性，
+            // 也不能把读线程长时间堵住——那会让 passthroughBuffer 越积越多。
+            if (wait > 0L) {
+                try {
+                    Thread.sleep(wait.coerceAtMost(40L))
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return false
+                }
+            }
+            nextSendAt += intervalMs
+            // 落后超过 200ms 就重锚，避免延迟越积越多（断流后恢复的常见场景）
+            val after = android.os.SystemClock.uptimeMillis()
+            if (after - nextSendAt > 200L) nextSendAt = after
+        }
         val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
         markerPending = false
         sequence = (sequence + 1) and 0xFFFF

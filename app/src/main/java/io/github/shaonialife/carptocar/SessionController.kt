@@ -1718,7 +1718,9 @@ object SessionController {
                     // _setupAudio 里 isOpus 时硬编码 sampleRate=48000 channels=1。
                     formatBit = 0x40000000L,
                     sampleRate = 48_000,
-                    latencyMs = 200, // 导航要低延迟，比媒体的 250ms 更紧
+                    // 导航仍比媒体紧，但不再压到 200：实测 200 时 playoutLead 只剩 17.9ms，
+                    // 偶发欠载。400 给一包以上余量，延迟增量对播报可忽略。
+                    latencyMs = 400,
                     streamType = altType,
                     codec = AudioCodec.OPUS,
                     channels = 1,
@@ -1728,7 +1730,7 @@ object SessionController {
                     audioType = "alert",
                     formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声（PCM_FORMAT[0x8000]）
                     sampleRate = 48_000,
-                    latencyMs = 200,
+                    latencyMs = 400,
                     streamType = altType,
                     codec = AudioCodec.PCM,
                 )
@@ -1736,7 +1738,9 @@ object SessionController {
         appendLog(
             "ALT-AUDIO: 尝试为导航播报协商独立流 type=$altType " +
                 "codec=${altProfile.codec.name} format=0x${altProfile.formatBit.toString(16)} " +
-                "${altProfile.sampleRate}Hz ${altProfile.channels}ch …",
+                "${altProfile.sampleRate}Hz ${altProfile.channels}ch " +
+                (if (altProfile.codec == AudioCodec.OPUS) "@${prefs.getInt("alt_opus_bitrate", 96_000) / 1000}kbps " else "") +
+                "…",
         )
         Thread({
             val info =
@@ -1763,6 +1767,8 @@ object SessionController {
                     adtsFrames = AudioTuning.RAW_SPF.adts,
                     controlPort = info.controlPort,
                     channels = altProfile.channels,
+                    // Apple 48kHz 档位是 96kbps（MacPlay cpStack.js 记录），可留 settings 覆盖做 A/B
+                    opusBitRate = prefs.getInt("alt_opus_bitrate", 96_000),
                 )
             if (sender.startPassthrough()) {
                 ttsAudioSender = sender
