@@ -35,6 +35,9 @@ internal class CarLifeAudioSink(
     @Volatile
     private var srcChannels = 2
 
+    /** 静音占位缓冲（见 [writeSilence]，复用避免每包分配）。 */
+    private var silenceBuf = ByteArray(0)
+
     private var packets = 0L
     private var bytes = 0L
     private var lastReportAt = 0L
@@ -173,6 +176,31 @@ internal class CarLifeAudioSink(
             sampledSinceReport++
             index += 32
         }
+    }
+
+    /**
+     * 写入等长的**静音**帧，用于「让路期间保持时间轴连续」。
+     *
+     * 背景（2026-10-28 实机）：导航播报时媒体包被 [CarLifeHijack.routeAudio] 直接丢弃，
+     * RTP 时间戳于是少推进整整一段（实测丢弃 465KB ≈ 2.4 秒）。播报结束后媒体从断点接上，
+     * 接收端看到的是「时间戳突然跳过一段」，jitter buffer 吃不满，
+     * 表现就是导航开头几句卡顿、偶尔 deviceRestarts。
+     *
+     * 改为喂静音后：样本数与丢弃前完全一致，时间轴线性推进，
+     * 播报期间听感仍是音乐静音（符合预期），但播报结束不再有跳变。
+     */
+    @Synchronized
+    fun writeSilence(size: Int) {
+        if (size <= 0) return
+        val sender = io.github.shaonialife.carptocar.SessionController.audioSender
+        if (sender == null || !sender.isRunning) return
+        // 复用零缓冲：静音内容恒为 0，无需每次分配（TTS 播报期每包都会走到这里）
+        if (silenceBuf.size < size) silenceBuf = ByteArray(size)
+        val rate = if (srcRate > 0) srcRate else DEFAULT_RATE
+        sender.feedPcm(silenceBuf, size, rate, srcChannels)
+        packets++
+        bytes += size
+        reportIfDue()
     }
 
     @Synchronized

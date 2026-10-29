@@ -901,10 +901,16 @@ object CarLifeHijack {
             // 媒体：播报期（含尾部保持窗）让路，避免两路样本串接导致时间轴翻倍
             if (now - ttsLastPacketAt < TTS_HOLD_MS) {
                 mediaYieldedBytes += size
+                // 方案 A（2026-10-28 实机）：**不丢包，改喂等长静音**。
+                // 原先直接 return 丢弃，RTP 时间戳会少推进整整一段（实测一次播报丢 465KB≈2.4s），
+                // 播报结束后媒体从断点接上 = 时间轴突然跳过一段，jitter buffer 吃不满，
+                // 听感正是「导航开头几句卡顿」+ 接收端 deviceRestarts。
+                // 喂静音后样本数不变，时间轴线性推进，播报期仍是音乐静音（符合预期）。
+                sink.writeSilence(size)
                 if (now - lastTtsYieldLog >= AUDIO_DROP_LOG_MS) {
                     lastTtsYieldLog = now
                     logSink?.invoke(
-                        "CARLIFE: 导航播报中——媒体暂让路（累计 ${mediaYieldedBytes / 1024}KB），播完自动恢复",
+                        "CARLIFE: 导航播报中——媒体以静音占位让路（累计 ${mediaYieldedBytes / 1024}KB），播完自动恢复",
                     )
                     mediaYieldedBytes = 0
                 }

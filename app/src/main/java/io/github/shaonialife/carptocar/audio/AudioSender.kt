@@ -456,21 +456,45 @@ class AudioSender(
         // 采样率一致直接返回
         if (inRate == sampleRate) return rateAligned
 
-        // 线性重采样（frame = 所有声道的一组采样）
+        // 线性插值重采样（frame = 所有声道的一组采样）
+        //
+        // 2026-10-28 改进：原实现是**最近邻取整**（srcPos = frame * inRate / sampleRate），
+        // 媒体 48k 直通不受影响，但导航 TTS 是 16kHz → 48kHz 的三倍上采样，
+        // 最近邻等于把每个样本复制三遍，高频台阶噪声明显，语音听起来发毛、发尖，
+        // 与「播报开头卡顿」叠加后更明显。这里改为线性插值。
         val inFrames = rateAligned.size / (rateChannels * 2)
         val outFrames = (inFrames.toLong() * sampleRate / inRate).toInt()
         val out = ByteArray(outFrames * CHANNELS * 2)
-        val chBytes = CHANNELS * 2
-        val inChBytes = rateChannels * 2
+        val inSamples = rateAligned.size / 2
+        val step = inRate.toDouble() / sampleRate
+        val lastFrame = maxOf(0, inFrames - 1)
         for (frame in 0 until outFrames) {
-            val srcPos = (frame.toLong() * inRate / sampleRate).toInt()
-            val srcByte = srcPos * inChBytes
-            val dstByte = frame * chBytes
-            if (srcByte + inChBytes <= rateAligned.size) {
-                System.arraycopy(rateAligned, srcByte, out, dstByte, inChBytes.coerceAtMost(chBytes))
+            val pos = frame * step
+            val i0 = pos.toInt().coerceIn(0, lastFrame)
+            val i1 = minOf(i0 + 1, lastFrame)
+            val frac = pos - i0
+            for (c in 0 until CHANNELS) {
+                val srcCh = minOf(c, rateChannels - 1)
+                val s0 = readS16(rateAligned, i0 * rateChannels + srcCh, inSamples)
+                val s1 = readS16(rateAligned, i1 * rateChannels + srcCh, inSamples)
+                val v = (s0 + (s1 - s0) * frac).toInt().coerceIn(-32768, 32767)
+                val dst = (frame * CHANNELS + c) * 2
+                out[dst] = (v and 0xFF).toByte()
+                out[dst + 1] = ((v shr 8) and 0xFF).toByte()
             }
         }
         return out
+    }
+
+    /** 读取 16bit 小端样本（越界返回 0，避免尾部插值越界）。 */
+    private fun readS16(
+        b: ByteArray,
+        sampleIndex: Int,
+        count: Int,
+    ): Int {
+        if (sampleIndex < 0 || sampleIndex >= count) return 0
+        val i = sampleIndex * 2
+        return ((b[i].toInt() and 0xFF) or (b[i + 1].toInt() shl 8)).toShort().toInt()
     }
 
     /** 走与采集循环一致的封包/编码/发送路径（[feedPcm] 与采集循环共用）。 */
