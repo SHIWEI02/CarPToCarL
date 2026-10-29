@@ -1648,17 +1648,33 @@ object SessionController {
     ) {
         val ctx = appContext?.applicationContext ?: return
         val prefs = ctx.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("alt_audio_stream_enabled", false)) return
+        if (!prefs.getBoolean("alt_audio_stream_enabled", false)) {
+            // 静默跳过太容易误判「代码没跑」——显式记一行
+            appendLog("ALT-AUDIO: 未启用（settings.alt_audio_stream_enabled=false）——走单流+静音压制")
+            return
+        }
         if (secret == null) {
             appendLog("ALT-AUDIO: 未配对会话没有共享密钥——跳过独立播报流")
             return
         }
-        val altType = prefs.getInt("alt_audio_stream_type", 108).toLong().coerceIn(1L, 999L)
+        // 101 = STREAM_TYPE_ALT_AUDIO（MacPlay cpStack.js 实测确认：
+        // MAIN_AUDIO=100 / ALT_AUDIO=101 / MAIN_HIGH_AUDIO=102。
+        // 早期猜的 108 不存在，MacPlay 会直接回 "stream type 108 not handled yet"）
+        // 108 是早期错误猜测值（协议里不存在该流类型），读到就当没设过——
+        // 否则已写进 settings 的旧值会盖掉新默认值，用户又得手动改 root 文件。
+        val storedType = prefs.getInt("alt_audio_stream_type", 101)
+        val altType = (if (storedType == 108) 101 else storedType).toLong().coerceIn(1L, 999L)
+        // audioType 必须是 "alert"（而不是 "media"）：
+        //   MacPlay cpStack.audioProfile() 的分支是
+        //     'media'  → audioType=3 → realtime=false（250ms 缓冲路径，给音乐用）
+        //     其它值   → audioType=4 → realtime=true （短路径）+ AudioNaviStart/Stop
+        //   导航走 media 就等于被塞进为音乐调优的大缓冲，正是「播报开头卡」的来源。
+        // 用 "alert" 会命中 default 分支 → 车机发 AudioNaviStart，由车机自己做 ducking。
         val altProfile = AudioProfile(
-            audioType = "media",
-            formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声
+            audioType = "alert",
+            formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声（PCM_FORMAT[0x8000]，零编码延迟）
             sampleRate = 48_000,
-            latencyMs = 250,
+            latencyMs = 200, // 导航要低延迟，比媒体的 250ms 更紧
             streamType = altType,
             codec = AudioCodec.PCM,
         )
