@@ -32,6 +32,55 @@ class OpusEncoder(
 
         private const val MIME = "audio/opus"
         private const val TIMEOUT_US = 10_000L
+
+        /**
+         * 本机是否存在可用的 OPUS **编码器**（不是解码器）。
+         *
+         * 用途：SETUP 协商前先探一次。若先协商成 OPUS 再发现编码器起不来，
+         * 接收端已经把这条流按 OPUS 开好了，只能整条放弃——不如协商阶段就选 PCM。
+         *
+         * 设备实测（2026-10-29 小米 / Android 17）：`c2.android.opus.encoder`
+         * 存在，sdk 支持 8/12/16/24/48k、1~2 声道。
+         */
+        /**
+         * 端到端自检：创建编码器 → 喂若干帧静音 → 看能否吐出 OPUS 包 → 立刻释放。
+         *
+         * 返回可直接打进日志的一行诊断。`isSupported()` 只能证明「编码器列表里有它」，
+         * 不能证明它能真正编码（Codec2 组件缺 lib 或权限时照样能 createByType，
+         * 但 configure/start 会失败）。这里全程试一遍，代价只有几十毫秒。
+         */
+        fun probe(): String =
+            try {
+                val enc = OpusEncoder(48_000, 24_000) { }
+                if (!enc.start()) {
+                    "编码器创建失败"
+                } else {
+                    var packets = 0
+                    var maxBytes = 0
+                    // 静音 4 帧（960 样本 = 1920B/帧），Opus 有 lookahead，前几帧可能不出包
+                    repeat(6) {
+                        val out = enc.encode(ByteArray(pcmBytes()))
+                        packets += out.size
+                        out.forEach { if (it.size > maxBytes) maxBytes = it.size }
+                    }
+                    enc.stop()
+                    if (packets == 0) "编码器可启动但 6 帧静音未产出任何包" else "可用（6 帧静音出 $packets 包，最大 $maxBytes B）"
+                }
+            } catch (error: Throwable) {
+                "自检异常：${error.message}"
+            }
+
+        fun isSupported(): Boolean =
+            try {
+                android.media.MediaCodecList(android.media.MediaCodecList.REGULAR_CODECS)
+                    .codecInfos
+                    .any { info ->
+                        info.isEncoder &&
+                            info.supportedTypes.any { type -> type.equals(MIME, ignoreCase = true) }
+                    }
+            } catch (_: Throwable) {
+                false
+            }
     }
 
     private var codec: MediaCodec? = null
@@ -76,15 +125,21 @@ class OpusEncoder(
         pendingFrames.clear()
         try {
             // 喂输入
+            // 循环喂完：编码器的输入 buffer 可能小于一帧（一帧 1920B）。
+            // 原实现「喂不下就 inputDone=true」会让编码器**永久停止收数据**，
+            // 表现为「协商成功、Alt 流在推、但一包音频都没有」。
             if (!inputDone && pcmFrame.isNotEmpty()) {
-                val inIndex = c.dequeueInputBuffer(TIMEOUT_US)
-                if (inIndex >= 0) {
-                    val buf = c.getInputBuffer(inIndex) ?: return emptyList()
+                var offset = 0
+                while (offset < pcmFrame.size) {
+                    val inIndex = c.dequeueInputBuffer(TIMEOUT_US)
+                    if (inIndex < 0) break
+                    val buf = c.getInputBuffer(inIndex) ?: break
                     buf.clear()
-                    val n = minOf(pcmFrame.size, buf.remaining())
-                    buf.put(pcmFrame, 0, n)
+                    val n = minOf(pcmFrame.size - offset, buf.remaining())
+                    if (n <= 0) break
+                    buf.put(pcmFrame, offset, n)
                     c.queueInputBuffer(inIndex, 0, n, 0L, 0)
-                    if (n < pcmFrame.size) inputDone = true
+                    offset += n
                 }
             }
             // 取输出

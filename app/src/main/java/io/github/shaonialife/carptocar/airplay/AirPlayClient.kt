@@ -5,6 +5,7 @@ import android.os.SystemClock
 import io.github.shaonialife.carptocar.audio.AudioCodec
 import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioSender
+import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.audio.AudioTuning
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.Iap2Csm
@@ -1733,8 +1734,12 @@ class AirPlayClient(
         val connectionId = (SecureRandom().nextLong() and Long.MAX_VALUE).coerceAtLeast(1L)
         // spf 取值：AAC 一帧 1024 采样；PCM 与发送端每包 352 帧保持一致
         val spfValue =
-            tuning.spf?.let {
-                if (profile.codec == AudioCodec.AAC_LC) it.toLong() else AudioSender.SAMPLES_PER_PACKET.toLong()
+            when (profile.codec) {
+                // OPUS 必须**显式**声明帧长：一帧 = 960 样本（20ms @48kHz）。
+                // 缺省时接收端按 PCM 的 352 排播，960/352 ≈ 2.73 倍 → 播放速度全错。
+                AudioCodec.OPUS -> OpusEncoder.FRAME_SAMPLES.toLong()
+                AudioCodec.AAC_LC -> tuning.spf?.toLong()
+                else -> tuning.spf?.let { AudioSender.SAMPLES_PER_PACKET.toLong() }
             }
         val body =
             BinaryPlist.encode(

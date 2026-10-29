@@ -23,6 +23,21 @@ class SenderApp : Application() {
         // 之后的部分。必须在这里写（Application 是进程最早入口），晚于任何业务日志
         // 都会让它被算进「历史」。
         DebugFileLog.markSessionStart(this)
+        // OPUS 编码器可用性自检（导航独立流 type=101 用 OPUS，见 OpusEncoder）。
+        // 进程启动即探一次：编码器能不能真编出包，不该等到连上车机才发现。
+        // 只 DEBUG 构建跑，避免正式包每次冷启动都创建一次 MediaCodec。
+        if (BuildConfig.DEBUG) {
+            Thread(
+                {
+                    try {
+                        Log.i(TAG, "OPUS 自检 = ${io.github.shaonialife.carptocar.audio.OpusEncoder.probe()}")
+                    } catch (error: Throwable) {
+                        Log.w(TAG, "OPUS 自检异常 - ${error.message}")
+                    }
+                },
+                "opus-probe",
+            ).apply { isDaemon = true }.start()
+        }
         // 完整会话报文录制（files/session_trace.log）：与上面的过程日志分开两份文件，
         // 原因见 SessionTrace 注释（报文量大会挤掉过程日志）。必须在业务起来之前 attach。
         SessionTrace.attach(this)

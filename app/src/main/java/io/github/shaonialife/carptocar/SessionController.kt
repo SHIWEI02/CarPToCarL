@@ -9,6 +9,7 @@ import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioProfileMemory
 import io.github.shaonialife.carptocar.audio.AudioSender
 import io.github.shaonialife.carptocar.audio.AudioTuning
+import io.github.shaonialife.carptocar.audio.OpusEncoder
 import io.github.shaonialife.carptocar.bt.BtProfiles
 import io.github.shaonialife.carptocar.bt.BtSessionGate
 import io.github.shaonialife.carptocar.bt.Iap2BluetoothClient
@@ -1688,15 +1689,55 @@ object SessionController {
         //     其它值   → audioType=4 → realtime=true （短路径）+ AudioNaviStart/Stop
         //   导航走 media 就等于被塞进为音乐调优的大缓冲，正是「播报开头卡」的来源。
         // 用 "alert" 会命中 default 分支 → 车机发 AudioNaviStart，由车机自己做 ducking。
-        val altProfile = AudioProfile(
-            audioType = "alert",
-            formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声（PCM_FORMAT[0x8000]，零编码延迟）
-            sampleRate = 48_000,
-            latencyMs = 200, // 导航要低延迟，比媒体的 250ms 更紧
-            streamType = altType,
-            codec = AudioCodec.PCM,
+        // 编码：无线 CarPlay 的低延迟流，真机用的是 **OPUS** —— MacPlay `getInfo.js`
+        // 注释原文「PCM is USB-only, so over wireless the phone picks OPUS for the
+        // low-latency streams (100/101) and AAC-LC for the entertainment stream (102)」。
+        // PCM 在局域网里也能被宽容接收（2026-10-29 实测 5770/5770 全解码），但
+        // 48k 立体声 PCM 是 1.5Mbps，OPUS 语音只要 24kbps。
+        // 留 settings 开关便于回退，不用重编：
+        //   alt_audio_codec = "opus"（默认）/ "pcm"
+        val wantOpus = prefs.getString("alt_audio_codec", "opus")?.lowercase() != "pcm"
+        // 协商前先确认本机真能编 OPUS：协商成 OPUS 但编码器起不来，接收端已按
+        // OPUS 开好管道，只能整条放弃。自检代价几十毫秒，值得。
+        var useOpus = false
+        if (wantOpus) {
+            if (!OpusEncoder.isSupported()) {
+                appendLog("ALT-AUDIO: 本机编码器列表里没有 OPUS——改用 PCM 协商")
+            } else {
+                val diag = OpusEncoder.probe()
+                appendLog("ALT-AUDIO: OPUS 自检 = $diag")
+                useOpus = !diag.startsWith("编码器创建失败") && !diag.contains("未产出")
+                if (!useOpus) appendLog("ALT-AUDIO: OPUS 实测不可用——改用 PCM 协商")
+            }
+        }
+        val altProfile =
+            if (useOpus) {
+                AudioProfile(
+                    audioType = "alert",
+                    // OPUS 48k mono：MacPlay 的 OPUS_MONO = 0x10000000|0x20000000|0x40000000，
+                    // _setupAudio 里 isOpus 时硬编码 sampleRate=48000 channels=1。
+                    formatBit = 0x40000000L,
+                    sampleRate = 48_000,
+                    latencyMs = 200, // 导航要低延迟，比媒体的 250ms 更紧
+                    streamType = altType,
+                    codec = AudioCodec.OPUS,
+                    channels = 1,
+                )
+            } else {
+                AudioProfile(
+                    audioType = "alert",
+                    formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声（PCM_FORMAT[0x8000]）
+                    sampleRate = 48_000,
+                    latencyMs = 200,
+                    streamType = altType,
+                    codec = AudioCodec.PCM,
+                )
+            }
+        appendLog(
+            "ALT-AUDIO: 尝试为导航播报协商独立流 type=$altType " +
+                "codec=${altProfile.codec.name} format=0x${altProfile.formatBit.toString(16)} " +
+                "${altProfile.sampleRate}Hz ${altProfile.channels}ch …",
         )
-        appendLog("ALT-AUDIO: 尝试为导航播报协商独立流 type=$altType …")
         Thread({
             val info =
                 try {
@@ -1717,10 +1758,11 @@ object SessionController {
                     log = { line -> appendLog(line) },
                     context = ctx,
                     sampleRate = info.sampleRate,
-                    codec = AudioCodec.PCM,
+                    codec = altProfile.codec,
                     streamType = altType,
                     adtsFrames = AudioTuning.RAW_SPF.adts,
                     controlPort = info.controlPort,
+                    channels = altProfile.channels,
                 )
             if (sender.startPassthrough()) {
                 ttsAudioSender = sender
@@ -1792,6 +1834,7 @@ object SessionController {
                 streamType = profile.streamType,
                 adtsFrames = AudioTuning.RAW_SPF.adts,
                 controlPort = info.controlPort,
+                channels = profile.channels,
             )
         audioSender = sender
         if (!sender.startPassthrough()) {

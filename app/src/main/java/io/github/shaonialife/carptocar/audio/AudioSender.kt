@@ -61,6 +61,11 @@ class AudioSender(
      * 发一个 [AudioSyncPacket] 建立 RTP↔NTP 锚点；0 = 车机没给（旧车机），只发音频。
      */
     private val controlPort: Int = 0,
+    /**
+     * 目标声道数。默认 2（PCM/AAC 媒体通路）；[AudioCodec.OPUS] 必须传 1。
+     * 见 [AudioProfile.channels] 的说明。
+     */
+    private val channels: Int = CHANNELS,
 ) {
     companion object {
         const val CHANNELS = 2
@@ -124,6 +129,9 @@ class AudioSender(
     /** AAC-LC 编码器（仅 [AudioCodec.AAC_LC] 时创建）。 */
     private var aacEncoder: AacLcEncoder? = null
 
+    /** OPUS 编码器（仅 [AudioCodec.OPUS] 时创建）。 */
+    private var opusEncoder: OpusEncoder? = null
+
     /**
      * RTP 游标（原本是采集循环里的局部变量）。提到字段上是因为**同步包线程**要读
      * 「当前/下一包时间戳」，否则锚点里的时间戳永远对不上真实发出的包。
@@ -140,11 +148,21 @@ class AudioSender(
 
     /** 每包/每帧对应的 PCM 字节数（PCM 通路=一包的负载；AAC 通路=一帧的输入）。 */
     private val framePcmBytes: Int
-        get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.pcmBytes(CHANNELS) else PACKET_BYTES
+        get() =
+            when (codec) {
+                AudioCodec.AAC_LC -> AacLcEncoder.pcmBytes(channels)
+                AudioCodec.OPUS -> OpusEncoder.pcmBytes()
+                else -> samplesPerPacket.toInt() * channels * 2
+            }
 
     /** 每包推进的样本数（AAC 一帧 1024，PCM 一包 352）。 */
     private val samplesPerPacket: Long
-        get() = if (codec == AudioCodec.AAC_LC) AacLcEncoder.FRAME_SAMPLES.toLong() else SAMPLES_PER_PACKET.toLong()
+        get() =
+            when (codec) {
+                AudioCodec.AAC_LC -> AacLcEncoder.FRAME_SAMPLES.toLong()
+                AudioCodec.OPUS -> OpusEncoder.FRAME_SAMPLES.toLong()
+                else -> SAMPLES_PER_PACKET.toLong()
+            }
 
     /**
      * RTP SSRC：固定 0（catplay `prepare_header` 在真车上即用 0；DiPlay 收端不校验）。
@@ -350,6 +368,16 @@ class AudioSender(
                     return false
                 }
                 aacEncoder = encoder
+            } else if (codec == AudioCodec.OPUS) {
+                // 导航语音 24kbps 足够（MacPlay 建议 tier：≤24kHz 用 48kbps，
+                // 但那是给音乐/麦克风的；语音提示 24kbps 清晰度已超出 16k 源的上限）
+                val encoder = OpusEncoder(sampleRate, bitRate = 24_000, log = log)
+                if (!encoder.start()) {
+                    client.close()
+                    socket = null
+                    return false
+                }
+                opusEncoder = encoder
             }
 
             running.set(true)
@@ -357,7 +385,8 @@ class AudioSender(
             // 静音 STREAM_MUSIC 可能破坏引擎的采集源（采集点不确定，不能赌是 REMOTE_SUBMIX）。
             log(
                 "AUDIO: 已启动直通模式（外部注入 PCM → $host:$dataPort，" +
-                    "通路=t$streamType/${codec.name}，目标 ${sampleRate}Hz 立体声）",
+                    "通路=t$streamType/${codec.name}，目标 ${sampleRate}Hz " +
+                    (if (channels == 1) "单声道" else "立体声") + "）",
             )
             startSyncLoop()
             true
@@ -432,7 +461,7 @@ class AudioSender(
         // 先处理声道：单声道 → 立体声（复制到左右）
         var rateAligned: ByteArray
         var rateChannels = inCh
-        if (inCh == 1 && CHANNELS == 2) {
+        if (inCh == 1 && channels == 2) {
             val monoFrames = size / 2
             val out = ByteArray(monoFrames * 4)
             var i = 0
@@ -464,7 +493,7 @@ class AudioSender(
         // 高频台阶噪声明显，语音听起来发毛、发尖，与「播报开头卡顿」叠加后更明显。
         val inFrames = rateAligned.size / (rateChannels * 2)
         val outFrames = (inFrames.toLong() * sampleRate / inRate).toInt()
-        val out = ByteArray(outFrames * CHANNELS * 2)
+        val out = ByteArray(outFrames * channels * 2)
         val inSamples = rateAligned.size / 2
         val step = inRate.toDouble() / sampleRate
         val lastFrame = maxOf(0, inFrames - 1)
@@ -473,12 +502,12 @@ class AudioSender(
             val i0 = pos.toInt().coerceIn(0, lastFrame)
             val i1 = minOf(i0 + 1, lastFrame)
             val frac = pos - i0
-            for (c in 0 until CHANNELS) {
+            for (c in 0 until channels) {
                 val srcCh = minOf(c, rateChannels - 1)
                 val s0 = readS16(rateAligned, i0 * rateChannels + srcCh, inSamples)
                 val s1 = readS16(rateAligned, i1 * rateChannels + srcCh, inSamples)
                 val v = (s0 + (s1 - s0) * frac).toInt().coerceIn(-32768, 32767)
-                val dst = (frame * CHANNELS + c) * 2
+                val dst = (frame * channels + c) * 2
                 out[dst] = (v and 0xFF).toByte()
                 out[dst + 1] = ((v shr 8) and 0xFF).toByte()
             }
@@ -501,11 +530,16 @@ class AudioSender(
     private fun dispatchPcm(pcm: ByteArray) {
         try {
             val payloads: List<ByteArray> =
-                if (codec == AudioCodec.AAC_LC) {
-                    val encoder = aacEncoder ?: return
-                    encoder.encode(pcm, pcm.size)
-                } else {
-                    listOf(pcm)
+                when (codec) {
+                    AudioCodec.AAC_LC -> {
+                        val encoder = aacEncoder ?: return
+                        encoder.encode(pcm, pcm.size)
+                    }
+                    AudioCodec.OPUS -> {
+                        val encoder = opusEncoder ?: return
+                        encoder.encode(pcm)
+                    }
+                    else -> listOf(pcm)
                 }
             if (payloads.isEmpty()) return
             var sendFailed = false
@@ -537,6 +571,8 @@ class AudioSender(
         record = null
         aacEncoder?.stop()
         aacEncoder = null
+        opusEncoder?.stop()
+        opusEncoder = null
         runCatching { socket?.close() }
         socket = null
         runCatching { syncSocket?.close() }
@@ -828,7 +864,9 @@ class AudioSender(
         //
         // AAC 通路不做换序：AAC 比特流是字节流，不是 16bit 样本序列，换序会直接把
         // 比特流搅烂（车机解码失败 → 有包无声）。
-        val wirePayload = if (codec == AudioCodec.AAC_LC) pcm else bigEndianS16(pcm)
+        // 只有裸 PCM 是 16bit 样本序列，需要换序；AAC / OPUS 都是**压缩字节流**，
+        // 换序会把比特流搅烂（车机解码失败 → 有包无声）。
+        val wirePayload = if (codec == AudioCodec.PCM) bigEndianS16(pcm) else pcm
         val sealed = AirPlayCrypto.chachaSeal(streamKey, AirPlayCrypto.nonce64(nonceCounter), wirePayload, aad)
         val wire = ByteArray(RTP_HEADER_LEN + sealed.size + NONCE_SIZE)
         header.copyInto(wire, 0)

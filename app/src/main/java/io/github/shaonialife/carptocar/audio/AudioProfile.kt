@@ -7,6 +7,17 @@ enum class AudioCodec {
 
     /** AAC-LC 裸帧（无 ADTS/AU 头），type=102 通路。 */
     AAC_LC,
+
+    /**
+     * 裸 OPUS 包（无 Ogg 封装），type=101 alt 通路。
+     *
+     * 无线 CarPlay 的低延迟流（100/101）真机选的就是 OPUS —— MacPlay 的
+     * `getInfo.js` 注释原文：「PCM is USB-only, so over wireless the phone
+     * picks OPUS for the low-latency streams (100/101) and AAC-LC for the
+     * entertainment stream (102)」。PCM 虽在局域网里也能被宽容接收，但
+     * 48k 立体声 PCM 是 1.5Mbps，而 OPUS 语音只需 24kbps。
+     */
+    OPUS,
 }
 
 /**
@@ -38,6 +49,15 @@ data class AudioProfile(
     val streamType: Long = 100L,
     /** 负载编码方式。 */
     val codec: AudioCodec = AudioCodec.PCM,
+    /**
+     * 声道数。默认 2（PCM/AAC 的媒体通路）；[AudioCodec.OPUS] 必须为 1。
+     *
+     * 为什么 OPUS 只能单声道：MacPlay `getInfo.js` 声明的是 `OPUS = 0x70000000`
+     * 注释「OPUS 16k/24k/48k **mono**」，`_setupAudio` 里也硬编码
+     * `if (isOpus) { sampleRate = 48000; channels = 1 }`。发立体声 OPUS 会被
+     * 按单声道解码，音高/时长全错。
+     */
+    val channels: Int = 2,
 ) {
     /** 持久化记忆的键（含流类型与编码：同一 audioType/格式 在不同通路上完全不同）。 */
     val key: String get() = "$streamType|${audioType.lowercase()}|$formatBit|${codec.name}"
