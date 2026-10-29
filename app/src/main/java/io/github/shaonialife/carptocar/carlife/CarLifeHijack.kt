@@ -935,6 +935,10 @@ object CarLifeHijack {
             val altOn = io.github.shaonialife.carptocar.SessionController.ttsAudioSender?.isRunning == true
             if (isTts) {
                 if (!altOn) ttsLastPacketAt = now // 仅单流模式才需要压制媒体
+                // 双流模式下也要记录：通话看门狗靠这个时间戳区分
+                // 「导航播报抬起的 mode」和「真通话」，否则每次播报都会
+                // 被当作通话结束、拆掉主媒体流重建（空窗 2s+）。
+                io.github.shaonialife.carptocar.SessionController.lastTtsPacketAt = now
                 sink.write(0, 0, pcm, size)
                 return
             }

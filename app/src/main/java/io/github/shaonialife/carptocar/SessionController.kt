@@ -443,6 +443,24 @@ object SessionController {
     @Volatile
     var ttsAudioSender: AudioSender? = null
 
+    /**
+     * 最近一次收到 CarLife **导航播报（TTS）**音频包的时刻（uptimeMillis）。
+     *
+     * 用途：CarLife 播报走的是「语音通信」用途的 AudioTrack，会把
+     * `AudioManager.mode` 抬到 `MODE_IN_COMMUNICATION`，播完又降回 NORMAL。
+     * 通话看门狗只盯着 mode 变化，于是每次导航播报都被误判成「通话结束」，
+     * 进而拆掉**主媒体流**重建——实测媒体空窗 2s 以上，这正是「导航声音卡」
+     * 的主要残余来源。
+     *
+     * 判据：真通话期间不会有 TTS 音频包；有 TTS 包就说明这次 mode 抬升是
+     * 导航引起的。`CarLifeHijack.routeAudio` 每次写 TTS 包时刷新此值。
+     */
+    @Volatile
+    var lastTtsPacketAt: Long = 0L
+
+    /** TTS 包之后多久内仍认为「mode 变化由导航引起」。 */
+    private const val TTS_CALL_GUARD_MS = 3_000L
+
     @Volatile
     var currentClient: AirPlayClient? = null
 
@@ -1841,6 +1859,21 @@ object SessionController {
                     if (mode == lastMode) continue
                     appendLog("AUDIO: 音频模式 ${audioModeName(lastMode)} → ${audioModeName(mode)}")
                     if (isCallMode(lastMode) && !isCallMode(mode)) {
+                        // 先排掉「导航播报结束」这种假通话：CarLife 播 TTS 时用
+                        // 「语音通信」用途的 AudioTrack，mode 会被抬起来再放下，
+                        // 若不排除就会每次播报都重建主媒体流（实测空窗 2s+）。
+                        val ttsAt = lastTtsPacketAt
+                        val ttsRecent =
+                            ttsAt > 0L &&
+                                android.os.SystemClock.uptimeMillis() - ttsAt < TTS_CALL_GUARD_MS
+                        if (ttsRecent) {
+                            appendLog(
+                                "AUDIO: 模式回落由导航播报引起（${android.os.SystemClock.uptimeMillis() - ttsAt}ms 前有 TTS 包）" +
+                                    "——不重建音频流",
+                            )
+                            lastMode = mode
+                            continue
+                        }
                         appendLog("AUDIO: 通话结束——重新核对车机音量并补同步包（车机常停在静音位）")
                         currentClient?.refreshVolume("通话结束")
                         sender.resyncAnchor("通话结束")
