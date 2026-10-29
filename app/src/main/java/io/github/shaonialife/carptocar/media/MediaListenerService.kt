@@ -148,6 +148,7 @@ class MediaListenerService : NotificationListenerService() {
                     artist =
                         meta?.getString(MediaMetadata.METADATA_KEY_ARTIST)
                             ?: meta?.getString(MediaMetadata.METADATA_KEY_ALBUM_ARTIST),
+                    album = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM),
                     playing = playing,
                     art = artFor(controller, meta, title),
                     pkg = controller.packageName,
@@ -228,6 +229,8 @@ object MediaSessionsState {
     data class NowPlaying(
         val title: String?,
         val artist: String?,
+        /** 专辑名（METADATA_KEY_ALBUM）。此前缺失导致 iAP2 0x5001 的 album 恒为空。 */
+        val album: String? = null,
         val playing: Boolean,
         val art: android.graphics.Bitmap? = null,
         /** 媒体会话所属应用（点击封面拉回正在播放的应用）。 */

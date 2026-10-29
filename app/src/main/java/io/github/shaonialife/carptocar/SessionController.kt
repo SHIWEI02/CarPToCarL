@@ -258,12 +258,16 @@ object SessionController {
      * 读不到再退回 CarLife 0x10035 推来的媒体信息；两者皆无返回 null（不响应）。
      */
     private fun buildNowPlaying(): CarPlayNowPlaying? {
+        val carlife = CarLifeHijack.latestMediaInfo
         val session = MediaSessionsState.nowPlaying
         if (session != null && session.title != null) {
             return CarPlayNowPlaying(
                 title = session.title,
                 artist = session.artist,
-                album = null, // MediaSession 未单独暴露专辑名，这里留空
+                // MediaSession 部分播放器不填专辑，用 CarLife 0x10035 解析出的专辑兜底
+                // （2026-10-29 实测：QQ音乐 MediaSession 侧无专辑，CarLife 侧有「秘密警察」）
+                album = session.album?.takeIf { it.isNotBlank() }
+                    ?: carlife?.album?.takeIf { it.isNotBlank() },
                 durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                 status =
                     if (session.playing) Iap2NowPlaying.STATUS_PLAYING

@@ -630,9 +630,9 @@ class GridActivity : AppCompatActivity() {
                     state
                         ?.copy(playing = !playing)
                         ?: MediaSessionsState.NowPlaying(
-                            null,
-                            null,
-                            !playing,
+                            title = null,
+                            artist = null,
+                            playing = !playing,
                         ),
                 )
                 panel.postDelayed(
