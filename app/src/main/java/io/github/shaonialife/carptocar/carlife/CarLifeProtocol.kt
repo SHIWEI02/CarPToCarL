@@ -426,7 +426,26 @@ internal object CarLifeProtocol {
      *   field 1 (cnt)      → tag 0x08 (varint)
      *   field 2 (mediaInfo)→ tag 0x12 (length-delimited，内嵌完整 CarlifeMediaInfo 子消息)
      */
+    /**
+     * 解析 0x10035 媒体信息载荷，兼容两种实际存在的封装：
+     *
+     * - **格式 A（协议文档）**：外层 `CarlifeMediaInfoList`——cnt(tag 0x08, varint) +
+     *   repeated mediaInfo(tag 0x12, length-delimited 子消息)。
+     * - **格式 B（本机引擎实测，2026-10-29）**：**直接推 `CarlifeMediaInfo` 本体，无 List 包装**，
+     *   首 tag 为 0x0a（field 1 source，wireType 2）。旧实现只认格式 A，遇到 0x0a 落到
+     *   else 分支立即 `return`，导致 217/217 恒解析为空、封面与歌名全部丢失。
+     *
+     * 先按格式 A 试，拿不到再按格式 B 解析本体。
+     */
     fun parseMediaInfoList(payload: ByteArray): List<CarLifeMediaInfo> {
+        val wrapped = parseMediaInfoListWrapped(payload)
+        if (wrapped.isNotEmpty()) return wrapped
+        val single = parseMediaInfo(payload, 0, payload.size)
+        return if (single != null) listOf(single) else emptyList()
+    }
+
+    /** 格式 A：外层 CarlifeMediaInfoList（cnt + repeated mediaInfo 子消息）。 */
+    private fun parseMediaInfoListWrapped(payload: ByteArray): List<CarLifeMediaInfo> {
         val result = ArrayList<CarLifeMediaInfo>()
         var index = 0
         while (index < payload.size) {
@@ -456,15 +475,38 @@ internal object CarLifeProtocol {
         return result
     }
 
-    /** 解析单个 CarlifeMediaInfo 子消息；解析不出歌名时返回 null。 */
+    /**
+     * 解析单个 CarlifeMediaInfo 子消息；歌名与歌手都为空时返回 null。
+     *
+     * **字段语义以 2026-10-29 本机引擎实测为准**（旧实现的映射是错位的，见下）：
+     *
+     * | 字段 | 真实语义 | 实测样例 |
+     * |---|---|---|
+     * | 1 | 媒体 ID（纯数字串） | `1793209917751` |
+     * | 2 | **当前歌词**（非歌名！） | `为你解冻冰河`（许嵩《有何不可》的歌词行） |
+     * | 3 | **「歌名-歌手」合并串** | `有何不可-许嵩` / `奢香夫人-凤凰传奇` |
+     * | 4 | 专辑 | `自定义`（正是许嵩的专辑名，可交叉验证） |
+     * | 5 | 封面（JPEG，魔数 `FF D8 FF E0 …JFIF`） | 2817B |
+     * | 6 | 时长，**单位秒** | 241（= 4:01，与《有何不可》时长吻合） |
+     * | 7 | 播放列表序号 | 0 |
+     * | 8 | 歌曲 ID | `241840` |
+     * | 9 | 播放模式 | 0 |
+     *
+     * 旧实现把 field 2 当歌名、field 3 当歌手，于是车机上显示的是**一句歌词**配一个
+     * 「歌名-歌手」当歌手名——完全错位。另外 field 6 被当成毫秒，实际是秒。
+     *
+     * 之所以要点名歌词：本程序在 98386 特征配置里主动声明了 `MEDIA_LYRIC_SUPPORT=1`，
+     * 引擎便会把当前歌词行塞进 field 2 并**逐行刷新**（这就是 0x10035 高频重推、
+     * 实测 217 次的原因——不是重复推同一条，是歌词在走）。
+     */
     private fun parseMediaInfo(
         payload: ByteArray,
         start: Int,
         end: Int,
     ): CarLifeMediaInfo? {
         var source = ""
-        var song = ""
-        var artist = ""
+        var lyricRaw = ""
+        var titleArtistRaw = ""
         var album = ""
         var albumArt: ByteArray? = null
         var duration = 0
@@ -486,8 +528,8 @@ internal object CarLifeProtocol {
                     val bytes = payload.copyOfRange(index, valueEnd)
                     when (field) {
                         1 -> source = bytes.toString(Charsets.UTF_8)
-                        2 -> song = bytes.toString(Charsets.UTF_8)
-                        3 -> artist = bytes.toString(Charsets.UTF_8)
+                        2 -> lyricRaw = bytes.toString(Charsets.UTF_8)
+                        3 -> titleArtistRaw = bytes.toString(Charsets.UTF_8)
                         4 -> album = bytes.toString(Charsets.UTF_8)
                         5 -> albumArt = bytes
                         8 -> songId = bytes.toString(Charsets.UTF_8)
@@ -500,7 +542,8 @@ internal object CarLifeProtocol {
                     val value = readVarint(payload, index)
                     index += varintLen(payload, index)
                     when (field) {
-                        6 -> duration = value
+                        // 单位是秒；个别引擎若给毫秒（数值会大得离谱），兜底换算成秒
+                        6 -> duration = if (value >= 10_000) value / 1000 else value
                         7 -> playlistNum = value
                         9 -> mode = value
                     }
@@ -510,8 +553,37 @@ internal object CarLifeProtocol {
                 else -> return null
             }
         }
+        // field 3 是「歌名-歌手」合并串：按第一个 '-' 拆开。
+        // 没有 '-' 时整串当歌名（歌手留空），避免出现「歌名=整串、歌手=空」的错乱。
+        val (song, artist) = splitTitleArtist(titleArtistRaw)
         if (song.isBlank() && artist.isBlank()) return null
-        return CarLifeMediaInfo(source, song, artist, album, albumArt, duration, playlistNum, songId, mode)
+        return CarLifeMediaInfo(
+            source,
+            song,
+            artist,
+            album,
+            albumArt,
+            duration,
+            playlistNum,
+            songId,
+            mode,
+            lyricRaw,
+        )
+    }
+
+    /**
+     * 拆「歌名-歌手」合并串。用**第一个** '-' 分割：歌手名里带 '-' 的概率
+     * （如「Twins-阿Sa」）低于歌名带 '-' 的概率？——实测两者都罕见，取第一个即可；
+     * 找不到 '-' 就把整串当歌名。同时裁掉两侧空白。
+     */
+    private fun splitTitleArtist(raw: String): Pair<String, String> {
+        val text = raw.trim()
+        if (text.isBlank()) return "" to ""
+        val sep = text.indexOf('-')
+        if (sep < 0) return text to ""
+        val title = text.substring(0, sep).trim()
+        val artist = text.substring(sep + 1).trim()
+        return if (title.isBlank()) text to "" else title to artist
     }
 
     private fun readVarint(
@@ -563,7 +635,12 @@ internal object CarLifeProtocol {
     }
 }
 
-/** CarLife 车机侧收到的一条媒体信息（0x10035 载荷的单个元素）。 */
+/**
+ * CarLife 引擎推送的媒体信息（0x10035）。
+ *
+ * [duration] 单位是**秒**（实测 241 = 4:01），不是毫秒——下游转 iAP2 时记得 ×1000。
+ * [lyric] 是当前歌词行（引擎逐行刷新推送，所以同一首歌会反复收到本结构）。
+ */
 data class CarLifeMediaInfo(
     val source: String,
     val song: String,
@@ -574,4 +651,5 @@ data class CarLifeMediaInfo(
     val playlistNum: Int,
     val songId: String,
     val mode: Int,
+    val lyric: String = "",
 )

@@ -877,11 +877,24 @@ object CarLifeHijack {
         }
     }
 
-    /** 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。 */
+    /**
+     * 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。
+     *
+     * **只在元数据真的变了才广播**：因为 field 2 是当前歌词行，引擎会**逐行**重推
+     * 0x10035（实测一首歌 217 次）。若不去重，每次都会打一条歌名日志并全量补推
+     * 0x5001，纯属浪费。歌词变化不触发广播——车机侧也没有歌词字段可消费。
+     */
     private fun onMediaInfo(info: CarLifeMediaInfo) {
         latestMediaInfo = info
+        val key = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.size ?: 0}"
+        if (key == lastMediaInfoKey) return
+        lastMediaInfoKey = key
         mediaInfoListeners.forEach { runCatching { it(info) } }
     }
+
+    /** 上一次广播的媒体信息指纹（见 [onMediaInfo] 的去重说明）。 */
+    @Volatile
+    private var lastMediaInfoKey: String? = null
 
     // ---- 触控回传（车机 → 手机）----
 
