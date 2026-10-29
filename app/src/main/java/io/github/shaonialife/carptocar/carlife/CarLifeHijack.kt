@@ -900,6 +900,19 @@ object CarLifeHijack {
      *
      * @param isTts true = 这是导航播报通道（9241）的 PCM，享最高优先级
      */
+    /** 等长静音缓冲（复用，避免每包分配；按 4KB 步进增长）。 */
+    @Volatile
+    private var silenceBuf: ByteArray = ByteArray(0)
+
+    private fun silenceBuffer(size: Int): ByteArray {
+        var b = silenceBuf
+        if (b.size < size) {
+            b = ByteArray(((size + 4095) / 4096) * 4096)
+            silenceBuf = b
+        }
+        return b
+    }
+
     private fun routeAudio(
         sink: CarLifeAudioSink,
         pcm: ByteArray,
@@ -914,16 +927,21 @@ object CarLifeHijack {
                 sink.write(0, 0, pcm, size)
                 return
             }
-            // 媒体：播报期（含尾部保持窗）让路，避免两路样本串接导致时间轴翻倍
+            // 媒体：播报期（含尾部保持窗）写**等长静音**占用时间轴，而不是丢包。
+            //
+            // 2026-10-29 修正（对齐 origin/main 94078a6）：原实现直接 return 丢弃，
+            // RTP 时间戳整整少推进这一段——播报结束从断点接上就是时间轴跳变，
+            // 正是「导航开头几句卡顿」的来源。写等长静音让时间轴连续，接收端无需重锚。
             if (now - ttsLastPacketAt < TTS_HOLD_MS) {
                 mediaYieldedBytes += size
                 if (now - lastTtsYieldLog >= AUDIO_DROP_LOG_MS) {
                     lastTtsYieldLog = now
                     logSink?.invoke(
-                        "CARLIFE: 导航播报中——媒体暂让路（累计 ${mediaYieldedBytes / 1024}KB），播完自动恢复",
+                        "CARLIFE: 导航播报中——媒体写静音占位（累计 ${mediaYieldedBytes / 1024}KB），播完自动恢复",
                     )
                     mediaYieldedBytes = 0
                 }
+                sink.write(0, 0, silenceBuffer(size), size)
                 return
             }
             sink.write(0, 0, pcm, size)
