@@ -14,6 +14,27 @@ import java.util.Locale
  * MainActivity 与 CarPlayService（投影生命周期诊断）共用同一把锁，避免同文件并发写交叉。
  */
 object DebugFileLog {
+    /**
+     * 日志文件上限。
+     *
+     * 2026-10-29 从 2MB 提到 16MB：真车测试一次可能跑几十分钟，视频推流
+     * （每秒 ~1 行 keepAlive/统计）+ iAP2 帧收发 + AirPlay 请求应答，2MB
+     * 会被冲掉——**一冲掉就把会话开头的 `/info`、`0x4301`、音频协商全丢了**，
+     * 而这些恰恰是事后定位最需要的部分。
+     */
+    private const val MAX_BYTES = 16_000_000L
+
+    /**
+     * 日志文件位置：优先外部私有目录 `/sdcard/Android/data/<pkg>/files/main_debug.log`
+     * ——`adb pull` 直接可取，不用 root 也不用 run-as。
+     * 外部存储不可用时回落 app 私有目录（行为与旧版一致）。
+     */
+    private fun logFile(context: Context): File =
+        File(context.getExternalFilesDir(null) ?: context.filesDir, "main_debug.log")
+
+    /** 日志文件的绝对路径（供 UI 显示 / 事后确认取哪个文件）。 */
+    fun pathOf(context: Context): String = logFile(context).absolutePath
+
     private val lock = Any()
     private val timestamp = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
 
@@ -48,7 +69,7 @@ object DebugFileLog {
         currentSessionOnly: Boolean,
     ): String? =
         runCatching {
-            val text = File(context.filesDir, "main_debug.log").readText(Charsets.UTF_8)
+            val text = logFile(context).readText(Charsets.UTF_8)
             if (currentSessionOnly) currentSessionSlice(text) else text
         }.getOrNull()
 
@@ -73,10 +94,10 @@ object DebugFileLog {
     ) {
         try {
             synchronized(lock) {
-                val file = File(context.filesDir, "main_debug.log")
+                val file = logFile(context)
                 // 超限直接删会连「本次启动」标记一起丢（导出就退化为全量历史）。
                 // 删后立即重写一条标记，保证截断后的新文件仍能按会话切分。
-                if (file.length() > 2_000_000) {
+                if (file.length() > MAX_BYTES) {
                     file.delete()
                     FileWriter(
                         file,
