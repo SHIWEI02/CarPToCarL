@@ -27,15 +27,19 @@ object DebugFileLog {
     /**
      * 日志文件位置：**必须是内部存储**（`/data/data/<pkg>/files/main_debug.log`）。
      *
-     * 2026-10-29 回退记录（重要）：一度改到 `getExternalFilesDir`（外部私有目录），
-     * 为的是 `adb pull` 方便。结果**切后台后投屏 30 秒必断**——外部存储走 FUSE，
-     * 后台被系统限流，而 [append] 当时是同步 open→write→close 且 `synchronized`，
-     * 于是所有调用 appendLog 的线程（iAP2 收流、CarLife 转发、视频发送）全部
-     * 排队等锁，音视频数据停发，接收端判死拆链。
-     * 实测：21:03:06→21:04:58 共 112 秒本进程零日志，同期 CarLife(32198) 一直
-     * 在正常送 onAudioStreamReady，进程 CPU 时间仍在增长 —— 不是被冻结，是卡在 I/O。
+     * 2026-10-29：曾短期改到 `getExternalFilesDir`（为 `adb pull` 方便），随后回退。
      *
-     * 内部存储 + 异步写两条一起才安全（见 [append]）。取日志用 root：
+     * **更正一个错误归因**：当时把「切后台投屏 30 秒必断」归到了外部存储上，是错的。
+     * 真因经系统日志确认是 MIUI 的 SmartPower 把进程降级成 cached：
+     *   21:03:09 I/SmartPower: io.github.shaonialife.carptocar/10401(31955):
+     *              background->idle(3000ms) R(become invisible) adj=200
+     * adj=200 即 cached，进程被整体挂起（连 Log.i 都不输出），与日志写哪无关。
+     *
+     * 但**同步日志 I/O 在热路径上确实是隐患**：视频 30fps、iAP2 每帧、音频诊断
+     * 每秒数十次 open→write→close 且持全局锁，存储一旦变慢就会拖住业务线程。
+     * 所以路径回到内部存储 + 写入改异步（见 [append]），两条独立成立。
+     *
+     * 取日志用 root：
      *   adb shell su -c "cat /data/data/io.github.shaonialife.carptocar/files/main_debug.log"
      */
     private fun logFile(context: Context): File = File(context.filesDir, "main_debug.log")
@@ -110,11 +114,10 @@ object DebugFileLog {
     /**
      * 追加一条日志。**非阻塞**：只入队，由单线程批量落盘。
      *
-     * 为什么必须异步（2026-10-29 实测）：原实现同步 `open → write → close` 且在
-     * `synchronized` 内，热路径（iAP2 收流 / CarLife 转发 / 视频发送）每秒要调
-     * 几十次。一旦存储变慢（外部存储 FUSE、切后台限流、磁盘忙），持锁的线程就被
-     * 拖住，其它线程全部排队 —— 表现为音视频停发、投屏 30 秒断链，而进程本身
-     * 没有崩溃也没有被冻结。日志是观测手段，绝不能反噬被测系统。
+     * 为什么异步：原实现同步 `open → write → close` 且在 `synchronized` 内，热路径
+     * （iAP2 收流 / CarLife 转发 / 视频发送）每秒要调几十次。存储一慢（磁盘忙、
+     * 后台限流、FUSE），持锁线程被拖住、其它线程排队，音视频就会跟着卡。
+     * 日志是观测手段，绝不能反噬被测系统 —— 这条是独立于任何具体 bug 的设计原则。
      */
     fun append(
         context: Context,
