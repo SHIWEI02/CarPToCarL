@@ -819,6 +819,21 @@ object SessionController {
         shellReady: Boolean,
     ): WifiCarPlayConnector.JoinResult {
         val connector = wifiConnector ?: return WifiCarPlayConnector.JoinResult.Unavailable
+        // 快路径：普通 WiFi 已连着目标 SSID。WifiNetworkSpecifier 对**已关联的同一 SSID**
+        // 会立即 onUnavailable（Android 不允许对同一 SSID 建第二条并发链路），等待只会
+        // 拖满超时再报「未允许加入」（2026-10-28 MacPlay 场景实测：0x5703 下发的 SSID
+        // 恰为家用路由器，手机本就连着它——specifier 每轮被拒，会话卡死 120s）。
+        // 此时直接绑定当前网络续流程，语义与「手动连接后绑定」一致。
+        if (shellWifiStatus().second == wifi.ssid) {
+            appendLog("WIFI: 普通 WiFi 已连着 \"${wifi.ssid}\"——跳过应用专属网络，直接绑定当前网络")
+            return if (bindCarWifiAndRegister(wifi.ssid)) {
+                connector.currentNetwork
+                    ?.let { WifiCarPlayConnector.JoinResult.Joined(it) }
+                    ?: WifiCarPlayConnector.JoinResult.Unavailable
+            } else {
+                WifiCarPlayConnector.JoinResult.Unavailable
+            }
+        }
         // 已保存到系统配置里才询问是否清除：不擅自删用户网络（有的场景就是要用
         // 车机流量/互联网，或用户希望系统自动连）。选择保留不影响本轮连接。
         if (shellReady) {
