@@ -709,6 +709,51 @@ object SessionController {
      * 「启动连接」主体（权限检查由 Activity 完成后调用）：前台保活服务 + 双向蓝牙。
      * 幂等：已有会话时 BT 组件的 start() 自行短路，不会双开。
      */
+    /** 本进程是否已弹过电池优化请求（避免每次连接都弹）。 */
+    @Volatile
+    private var batteryOptAsked = false
+
+    /**
+     * 请求加入电池优化白名单。
+     *
+     * 为什么必须做（2026-10-29）：Android 的 Doze 模式下，**即使持有
+     * PARTIAL_WAKE_LOCK，系统对后台应用的网络访问也会被挂起** —— WakeLock 只
+     * 保证 CPU 不被休眠，不保证网络可用。实测本机不在白名单时，待机分组虽然
+     * 是 ACTIVE，但息屏一段时间后视频 RTP 发不出去，接收端 20s 判死拆链，
+     * 表现正是「投屏一会儿自己断了」。
+     *
+     * 只在首次弹一次；用户拒绝就本次进程不再打扰，下次启动再问。
+     */
+    private fun ensureBatteryWhitelist(context: Context) {
+        val power = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager ?: return
+        if (power.isIgnoringBatteryOptimizations(context.packageName)) {
+            appendLog("POWER: 已在电池优化白名单——息屏不受 Doze 限网")
+            return
+        }
+        if (batteryOptAsked) {
+            appendLog("POWER: 仍不在电池优化白名单（本次已请求过）——息屏可能被 Doze 限网导致投屏断")
+            return
+        }
+        batteryOptAsked = true
+        appendLog("POWER: 不在电池优化白名单——请求加入（Doze 会挂起后台网络，导致投屏一会儿就断）")
+        try {
+            context.startActivity(
+                android.content.Intent(
+                    android.provider.Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    android.net.Uri.parse("package:" + context.packageName),
+                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (error: Exception) {
+            appendLog("POWER: 直接请求不可用（${error.javaClass.simpleName}）——跳转系统电池优化列表，请手动选「无限制」")
+            runCatching {
+                context.startActivity(
+                    android.content.Intent(android.provider.Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)
+                        .addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }
+        }
+    }
+
     fun startConnection(context: Context) {
         connectCancelled = false
         // 报文录制分界：一次点击 = 一段独立对话，事后按这行切分
@@ -719,6 +764,7 @@ object SessionController {
         phaseHint = "蓝牙就绪，等待车机回连…"
         // 新会话 = 新的 NowPlaying 上下文：清去重键，否则同一首歌重连后不会被重推
         resetNowPlayingDedupe()
+        ensureBatteryWhitelist(context)
         CarPlayService
             .start(context)
         // 能力发布先于连接（catplay 的做法：CarPlayCtrlServer 在会话一开始就常驻广播

@@ -69,6 +69,13 @@ class CarPlayService : Service() {
             buildNotification(),
             android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE,
         )
+        // 记启动来源：startId 递增 / REDELIVERY 说明服务被杀后由系统重启过，
+        // 这是判断「后台被系统清掉」最直接的证据。
+        fileLog(
+            "SVC: onStartCommand startId=" + startId +
+                " 重投递=" + (flags and START_FLAG_REDELIVERY != 0) +
+                " 重试=" + (flags and START_FLAG_RETRY != 0),
+        )
         acquireLocks()
         // 授权结果在（用户刚确认投屏）时：升级前台类型再创建投影（try/catch 兜底不崩）
         if (pendingProjectionResult != null) {
@@ -121,6 +128,19 @@ class CarPlayService : Service() {
         } catch (error: Exception) {
             fileLog("SVC: 升级 mediaProjection FGS 类型失败 - ${error.message}")
         }
+    }
+
+    /**
+     * 用户从最近任务卡片划掉 app。
+     *
+     * 服务声明了 `android:stopWithTask="false"`，默认不会随任务销毁，会话应继续；
+     * 但部分 ROM（MagicOS / MIUI）会连进程一起清掉。这里只记一行——
+     * 事后看日志能区分「用户划掉的」还是「系统杀的」（后者会出现 onStartCommand
+     * 重投递），不用瞎猜。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        fileLog("SVC: onTaskRemoved（任务卡片被划掉）——stopWithTask=false，服务应继续，会话不断")
+        super.onTaskRemoved(rootIntent)
     }
 
     override fun onDestroy() {

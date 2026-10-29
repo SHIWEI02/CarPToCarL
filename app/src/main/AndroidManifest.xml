@@ -25,6 +25,9 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Doze 模式会挂起后台网络（WakeLock 只保 CPU 不保网络），
+         没有白名单时息屏一段时间后视频 RTP 发不出去，接收端判死拆链 -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
     <!-- 音频通道：AudioPlaybackCapture（捕获本机媒体/导航声音上车）必需 -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
@@ -86,6 +89,7 @@
         <service
             android:name=".service.CarPlayService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="connectedDevice|mediaProjection" />
 
         <!-- 虚拟屏桌面（exported：shell am start 需要可从外部拉起） -->
