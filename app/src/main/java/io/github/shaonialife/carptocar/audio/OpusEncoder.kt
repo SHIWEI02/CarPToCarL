@@ -84,6 +84,21 @@ class OpusEncoder(
     }
 
     private var codec: MediaCodec? = null
+
+    /**
+     * 待喂给编码器的 PCM 帧。MediaCodec 的输入 buffer 可能一时拿不到
+     * （编码器还在处理上一批），拿不到时数据留在这里，绝不丢弃。
+     */
+    private val inputQueue = ArrayDeque<ByteArray>()
+    private var inputOffset = 0
+
+    /** 已喂入的帧数 / 已产出的包数（诊断丢帧用，见 [stats]）。 */
+    private var fedFrames = 0
+    private var outFrames = 0
+
+    /** 一行诊断：喂入 N 帧 → 产出 M 包，欠 M-N 表示编码器内部还有积压。 */
+    fun stats(): String = "喂入 $fedFrames 帧 / 产出 $outFrames 包 / 队列余 ${inputQueue.size} 帧"
+
     private var inputDone = false
     private var outputDone = false
     /** 每次 encode() 取回的输出帧（裸 OPUS 包）。 */
@@ -123,23 +138,42 @@ class OpusEncoder(
         val c = codec ?: return emptyList()
         if (outputDone) return emptyList()
         pendingFrames.clear()
+        if (pcmFrame.isNotEmpty()) {
+            inputQueue.addLast(pcmFrame)
+            fedFrames++
+        }
         try {
             // 喂输入
-            // 循环喂完：编码器的输入 buffer 可能小于一帧（一帧 1920B）。
-            // 原实现「喂不下就 inputDone=true」会让编码器**永久停止收数据**，
-            // 表现为「协商成功、Alt 流在推、但一包音频都没有」。
-            if (!inputDone && pcmFrame.isNotEmpty()) {
-                var offset = 0
-                while (offset < pcmFrame.size) {
-                    val inIndex = c.dequeueInputBuffer(TIMEOUT_US)
-                    if (inIndex < 0) break
+            //
+            // 2026-10-29 修：原实现是「dequeueInputBuffer 拿不到就 break」，
+            // 拿到一半就退出的情况**直接把剩余 PCM 丢掉**，且无补偿——
+            // 一帧 20ms，丢一帧就是 20ms 空档，听感正是「卡顿」。
+            // 现在未喂完的数据留在 inputQueue 里，下次 encode 接着喂，一字节不丢。
+            if (!inputDone) {
+                var guard = 0
+                while (inputQueue.isNotEmpty() && guard++ < 8) {
+                    val inIndex = c.dequeueInputBuffer(0L)
+                    if (inIndex < 0) break // 编码器忙，留着下次
                     val buf = c.getInputBuffer(inIndex) ?: break
                     buf.clear()
-                    val n = minOf(pcmFrame.size - offset, buf.remaining())
+                    val head = inputQueue.first()
+                    val remain = head.size - inputOffset
+                    if (remain <= 0) {
+                        inputQueue.removeFirst()
+                        inputOffset = 0
+                        c.queueInputBuffer(inIndex, 0, 0, 0L, 0)
+                        continue
+                    }
+                    val n = minOf(remain, buf.remaining())
                     if (n <= 0) break
-                    buf.put(pcmFrame, offset, n)
+                    buf.put(head, inputOffset, n)
+                    // Opus 编码器内部按 frame duration 切帧，分块喂是安全的
                     c.queueInputBuffer(inIndex, 0, n, 0L, 0)
-                    offset += n
+                    inputOffset += n
+                    if (inputOffset >= head.size) {
+                        inputQueue.removeFirst()
+                        inputOffset = 0
+                    }
                 }
             }
             // 取输出
@@ -158,6 +192,7 @@ class OpusEncoder(
                                 buf.position(info.offset)
                                 buf.get(frame)
                                 pendingFrames.addLast(frame)
+                                outFrames++
                             }
                         }
                         c.releaseOutputBuffer(outIndex, false)
@@ -183,5 +218,7 @@ class OpusEncoder(
         }
         codec = null
         pendingFrames.clear()
+        inputQueue.clear()
+        inputOffset = 0
     }
 }
