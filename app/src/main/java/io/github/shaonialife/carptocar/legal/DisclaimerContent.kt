@@ -27,7 +27,7 @@ internal object DisclaimerContent {
             Section(
                 title = "这是什么",
                 body =
-                    "CarDeck 是一个非官方的实验性项目：让一台未 root 的 Android 手机扮演 " +
+                    "CarPToCarL 是一个非官方的实验性项目：让一台未 root 的 Android 手机扮演 " +
                         "CarPlay 发送端（iPhone 角色），把手机上的车机桌面与第三方应用投到" +
                         "支持的接收端上显示，并把接收端触摸回注到手机侧的虚拟屏。\n\n" +
                         "本项目与 Apple Inc.、任何汽车厂商均无关联，未获得任何授权或认证，" +

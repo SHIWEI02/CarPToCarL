@@ -773,7 +773,7 @@ class MainActivity : AppCompatActivity() {
                 return@setOnClickListener
             }
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-            clipboard.setPrimaryClip(ClipData.newPlainText("CarDeck 日志", text))
+            clipboard.setPrimaryClip(ClipData.newPlainText("CarPToCarL 日志", text))
             snack("已复制 ${text.length} 字符日志")
         }
         findViewById<ImageView>(R.id.btnExportLog).setOnClickListener { exportLogFile() }
@@ -1776,7 +1776,7 @@ class MainActivity : AppCompatActivity() {
     private fun sh(cmd: String): String = shExec(cmd).output
 
     /**
-     * 导出日志到「下载/CarDeck/」并弹窗告知位置。
+     * 导出日志到「下载/CarPToCarL/」并弹窗告知位置。
      */
     private fun exportLogFile(scope: LogExporter.Scope = LogExporter.Scope.CURRENT_SESSION) {
         snack(if (scope == LogExporter.Scope.ALL) "正在导出全部日志…" else "正在导出本次启动的日志…")
@@ -1802,7 +1802,7 @@ class MainActivity : AppCompatActivity() {
                     message =
                         "文件位置：\n${result.displayPath}\n\n" +
                             "大小：${formatBytes(result.bytes)}\n$scopeNote\n\n" +
-                            "可在「文件管理 → 下载 → CarDeck」中找到，也可直接分享给开发者排查问题。",
+                            "可在「文件管理 → 下载 → CarPToCarL」中找到，也可直接分享给开发者排查问题。",
                     actions =
                         listOf(
                             DarkMessageDialog.Action("打开文件", DarkMessageDialog.Emphasis.PRIMARY) {
@@ -1874,7 +1874,7 @@ class MainActivity : AppCompatActivity() {
                 return
             }
         }
-        snack("请到「文件管理 → 下载 → CarDeck」查看", 5_000L)
+        snack("请到「文件管理 → 下载 → CarPToCarL」查看", 5_000L)
     }
 
     /** 用系统默认应用打开（多数 ROM 会落到文件管理器 / 文本查看器预览）。 */
@@ -1888,7 +1888,7 @@ class MainActivity : AppCompatActivity() {
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         if (runCatching { startActivity(view) }.isSuccess) return
-        // 无文本查看器时退到「文件管理器」：DocumentsUI 的内部存储根（用户按路径进 下载/CarDeck）
+        // 无文本查看器时退到「文件管理器」：DocumentsUI 的内部存储根（用户按路径进 下载/CarPToCarL）
         val storageRoot =
             Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(

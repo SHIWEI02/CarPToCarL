@@ -135,7 +135,7 @@ class MediaListenerService : NotificationListenerService() {
                 it.playbackState?.state == PlaybackState.STATE_PLAYING
             } ?: controllers.firstOrNull { it.metadata != null }
         // 保存活跃会话控制器：供车机媒体键直投（transportControls）使用，
-        // 不依赖 AudioManager 焦点路由（避免被 CarDeck 自身 AudioTrack 抢占）。
+        // 不依赖 AudioManager 焦点路由（避免被 CarPToCarL 自身 AudioTrack 抢占）。
         MediaSessionsState.activeController = picked
         val now =
             picked?.let { controller ->
@@ -261,7 +261,7 @@ object MediaSessionsState {
      * 当前活跃音乐会话的控制器（refresh 时由服务更新）。
      *
      * 用于「车机媒体键 → 手机音乐 App」的直投：`AudioManager.dispatchMediaKeyEvent`
-     * 依赖系统焦点路由（可能被 CarDeck 自身 AudioTrack 或其它会话干扰），直投
+     * 依赖系统焦点路由（可能被 CarPToCarL 自身 AudioTrack 或其它会话干扰），直投
      * transportControls 则**不依赖焦点**、精确命中当前正在播的 App。
      */
     @Volatile
@@ -273,7 +273,7 @@ object MediaSessionsState {
      * 返回 true = 已投递到某个活跃会话的 transportControls。
      *
      * 这是「媒体控制中转」的落点：车机媒体键 → 这里 → 手机音乐 App 真正暂停/切歌，
-     * 不经过系统焦点路由，避开 CarDeck 自身 AudioTrack 抢占焦点导致的误投。
+     * 不经过系统焦点路由，避开 CarPToCarL 自身 AudioTrack 抢占焦点导致的误投。
      */
     fun dispatchTransport(action: Int): Boolean {
         val controller = activeController ?: return false

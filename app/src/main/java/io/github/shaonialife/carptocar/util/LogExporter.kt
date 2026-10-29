@@ -11,7 +11,7 @@ import java.util.Date
 import java.util.Locale
 
 /**
- * 日志导出：把运行日志写成 `下载/CarDeck/CarDeck-log-<时间>.txt`，普通文件管理器可见。
+ * 日志导出：把运行日志写成 `下载/CarPToCarL/CarPToCarL-log-<时间>.txt`，普通文件管理器可见。
  *
  * 为什么落 MediaStore.Downloads 而不是应用私有目录：
  *  - `filesDir` / `getExternalFilesDir` 普通用户在文件管理器里找不到（Android 11+
@@ -41,8 +41,8 @@ object LogExporter {
         val scope: Scope,
     )
 
-    /** 导出目录（相对外部存储根）：下载/CarDeck。 */
-    private val RELATIVE_DIR = "${Environment.DIRECTORY_DOWNLOADS}/CarDeck"
+    /** 导出目录（相对外部存储根）：下载/CarPToCarL。 */
+    private val RELATIVE_DIR = "${Environment.DIRECTORY_DOWNLOADS}/CarPToCarL"
 
     /** 文件管理器里展示的绝对路径前缀（主用户外部存储；分区存储下即 /sdcard）。 */
     private const val DISPLAY_ROOT = "/storage/emulated/0"
@@ -55,7 +55,7 @@ object LogExporter {
     ): Result? {
         val body = buildContent(context, fallbackText, scope)
         val stamp = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(Date())
-        val fileName = "CarDeck-log-$stamp${scope.fileNameTag}.txt"
+        val fileName = "CarPToCarL-log-$stamp${scope.fileNameTag}.txt"
         val resolver = context.contentResolver
         val collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
         val values =
@@ -86,7 +86,7 @@ object LogExporter {
         scope: Scope,
     ): String =
         buildString {
-            appendLine("CarDeck 运行日志")
+            appendLine("CarPToCarL 运行日志")
             appendLine("导出时间: " + SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).format(Date()))
             appendLine("应用版本: " + versionName(context))
             appendLine("导出范围: " + scope.label)
@@ -108,6 +108,23 @@ object LogExporter {
                 // 启动标记刚写、其余日志还没落盘（或文件不可读）时，界面缓冲仍是有效来源
                 appendLine("（文件日志不可用——导出界面缓冲，可能不完整）")
                 append(fallbackText)
+            }
+            // 连接失败报文快照：只在「未建链就跑完一轮」时由 SessionTrace 落盘，
+            // 正常连接的轮次不产生文件（也不占空间）。附在这里，一份日志就能还原现场：
+            // 过程日志说我们放弃了什么，报文说车机最后发了什么。
+            val failure = SessionTrace.latestFailure(context)
+            val trace = failure?.let { SessionTrace.readFile(it) }
+            if (!trace.isNullOrBlank()) {
+                appendLine()
+                appendLine("============ 连接失败报文快照（${failure.name}）============")
+                appendLine("格式：[时刻] 方向 通道 类型 id 长度 报文体hex；TX=手机→车机，RX=车机→手机")
+                appendLine("（仅未建链的轮次才会生成；视频/音频帧不记录）")
+                appendLine("================================================================")
+                append(trace)
+                if (!trace.endsWith('\n')) appendLine()
+            } else {
+                appendLine()
+                appendLine("（本轮没有连接失败报文快照——没发生未建链的会话，或快照已被清理）")
             }
         }
 

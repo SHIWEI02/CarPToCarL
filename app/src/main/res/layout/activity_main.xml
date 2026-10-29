@@ -148,7 +148,7 @@
                         android:layout_gravity="center_horizontal|bottom"
                         android:layout_marginBottom="10dp"
                         android:letterSpacing="0.22"
-                        android:text="CARDECK"
+                        android:text="CARPTOCARL"
                         android:textColor="#5C6B6B"
                         android:textSize="10sp"
                         android:textStyle="bold" />

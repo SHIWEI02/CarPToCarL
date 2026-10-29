@@ -168,7 +168,7 @@ class CarPlayService : Service() {
             manager.createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ID,
-                    "CarDeck 连接",
+                    "CarPToCarL 连接",
                     NotificationManager.IMPORTANCE_LOW,
                 ).apply {
                     description = "保持与车机的连接"
@@ -189,7 +189,7 @@ class CarPlayService : Service() {
         return NotificationCompat
             .Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
-            .setContentTitle("CarDeck 运行中")
+            .setContentTitle("CarPToCarL 运行中")
             .setContentText("正在保持与车机的连接，点开应用可查看日志")
             .setContentIntent(contentIntent)
             .setAutoCancel(false)

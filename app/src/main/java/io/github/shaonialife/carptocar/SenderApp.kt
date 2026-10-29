@@ -8,6 +8,7 @@ import android.content.IntentFilter
 import android.util.Log
 import io.github.shaonialife.carptocar.launcher.VirtualLauncher
 import io.github.shaonialife.carptocar.util.DebugFileLog
+import io.github.shaonialife.carptocar.util.SessionTrace
 
 /**
  * 进程级安全网：任一线程的未捕获异常只记录并让该线程结束，
@@ -22,6 +23,9 @@ class SenderApp : Application() {
         // 之后的部分。必须在这里写（Application 是进程最早入口），晚于任何业务日志
         // 都会让它被算进「历史」。
         DebugFileLog.markSessionStart(this)
+        // 完整会话报文录制（files/session_trace.log）：与上面的过程日志分开两份文件，
+        // 原因见 SessionTrace 注释（报文量大会挤掉过程日志）。必须在业务起来之前 attach。
+        SessionTrace.attach(this)
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             Log.e(TAG, "未捕获异常（线程 ${thread.name}，已吞掉保进程）", throwable)

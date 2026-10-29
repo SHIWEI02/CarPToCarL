@@ -20,9 +20,11 @@ does not apply to them.
   share the same copyright holder, so no additional condition applies beyond
   keeping the copyright notice.
 
-  Historical naming that remains visible at runtime (log directory
-  "Download/CarDeck", the "CarDeck" process-start line) comes from that lineage;
-  it does not indicate a runtime dependency on the CarDeck application.
+  Older builds carried the predecessor's name in user-visible strings (the
+  "Download/CarDeck" log directory, the "CarDeck" process-start line). Current
+  builds use "CarPToCarL" throughout; the old paths may still exist on devices
+  upgraded from those builds. That lineage does not indicate a runtime
+  dependency on the CarDeck application.
 
 --------------------------------------------------------------------------------
 1. AndroidX / Jetpack  (Apache License 2.0)

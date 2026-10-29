@@ -13,7 +13,7 @@ object DisclaimerPrefs {
      * 当前免责声明版本。**修改 disclaimer_content 文案时必须同步 +1**——
      * 用户接受的是「当时那一版」内容，条款变了就该重新确认。
      *
-     * v2（2026-10-18）：应用改名 CarDeck，补「非官方」「非 MFi」与 MIT 开源说明。
+     * v2（2026-10-18）：应用改名 CarPToCarL，补「非官方」「非 MFi」与 MIT 开源说明。
      */
     const val CURRENT_VERSION = 2
 

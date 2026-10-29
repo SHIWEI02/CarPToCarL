@@ -38,6 +38,7 @@ import io.github.shaonialife.carptocar.util.SysShell
 import io.github.shaonialife.carptocar.ui.ScreenDimmer
 import io.github.shaonialife.carptocar.util.Bg
 import io.github.shaonialife.carptocar.util.DebugFileLog
+import io.github.shaonialife.carptocar.util.SessionTrace
 import io.github.shaonialife.carptocar.video.VideoSender
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -277,7 +278,8 @@ object SessionController {
             title = info.song.takeIf { it.isNotBlank() },
             artist = info.artist.takeIf { it.isNotBlank() },
             album = info.album.takeIf { it.isNotBlank() },
-            durationMs = info.duration,
+            // CarLife 的 duration 单位是秒（QQ音乐实测 241 = 4:01），iAP2 0x5001 要毫秒
+            durationMs = info.duration * 1000,
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
             elapsedMs = 0,
             appName = info.source.takeIf { it.isNotBlank() },
@@ -315,7 +317,7 @@ object SessionController {
      * 派发系统媒体键。桌面音乐卡的按钮与车机/方向盘媒体键（Consumer HID）共用这一路径。
      *
      * 优先级：**先直投当前活跃音乐会话的 transportControls**（不依赖焦点路由，精确命中
-     * 手机音乐 App，避开 CarDeck 自身 AudioTrack 抢占焦点导致的「暂停不生效」），
+     * 手机音乐 App，避开 CarPToCarL 自身 AudioTrack 抢占焦点导致的「暂停不生效」），
      * 直投失败再回退到 AudioManager 全局路由。
      */
     fun dispatchMediaKey(keyCode: Int) {
@@ -513,6 +515,8 @@ object SessionController {
         if (sessionStarting.compareAndSet(true, false)) {
             connectCancelled = true
             appendLog(">>> 本轮蓝牙链路断开——释放「会话处理中」，等待车机重连端点接手")
+            // 未推流就断链 = 这一轮没连上：报文快照落盘（成功过的轮次在 markLinked 时已丢弃）
+            SessionTrace.sessionEnd("蓝牙链路断开，未进入推流")
         }
     }
 
@@ -634,6 +638,8 @@ object SessionController {
      */
     fun startConnection(context: Context) {
         connectCancelled = false
+        // 报文录制分界：一次点击 = 一段独立对话，事后按这行切分
+        SessionTrace.sessionStart("用户点击启动连接")
         // 新一次用户点击 = 新的 5 分钟等待预算（断链重连不再重置，见 pendingWaitBudgetStartedAt）
         pendingWaitBudgetStartedAt = 0L
         pendingWaitGaveUp = false
@@ -668,6 +674,7 @@ object SessionController {
     /** 「断开连接」（可在任意 Activity 实例上调用——操作的是真管线对象）。 */
     fun disconnect(context: Context) {
         val hadProjection = CarPlayService.mediaProjection != null
+        SessionTrace.sessionEnd("用户手动断开")
         pendingEndpointUpdate = null
         retireSession()
         // BT 控制会话只在这里（用户终态）退役，socket close 让保活读循环立刻退出：
@@ -1361,6 +1368,8 @@ object SessionController {
                         "「启动连接」，并把日志发出来",
                 )
                 detachActiveBtSessions()
+                // 等待预算耗尽 = 这一轮确定连不上：把内存里的报文快照落盘（独立文件）
+                SessionTrace.sessionEnd("等待 0x4301 超时（车机未下发热点信息），本轮放弃")
             }
         }
     }
@@ -2622,9 +2631,12 @@ object SessionController {
                                 //   屏幕 SETUP → 连数据端口 → RECORD → 起编码器（出帧）→ 音频 SETUP
                                 // 音频 SETUP 失败只丢声音，视频会话保持。
                                 client.record()
+                                // RECORD 成功 = 会话活着。此刻丢弃报文缓冲：用户要的是
+                                // 「连不上」的现场，正常连接不需要快照（省空间也省导出体积）。
+                                SessionTrace.markLinked()
                                 if (host != null) {
                                     // CarLife 本地劫持是**唯一**画面来源（2026-10-24 用户要求
-                                    // 移除 CarDeck 自己的隐形屏画面）：手机原生 CarLife+ 的
+                                    // 移除 CarPToCarL 自己的隐形屏画面）：手机原生 CarLife+ 的
                                     // H.264 直接送进车机通道，不做 GL 合成、不重编码。
                                     // 码流在 App 启动时（CarLifeHijack.prewarm）就已开始接收并
                                     // 缓存 GOP，这里只需把数据端口接上再把缓存帧灌进去。

@@ -22,7 +22,14 @@ object DebugFileLog {
      * 历史轮次的日志会把真正有用的部分淹没——导出默认只取最后一条标记之后的内容。
      * 标记本身写进文件而不是只记内存偏移：文件可能被 2MB 截断，偏移会失效。
      */
-    const val SESSION_MARKER = "===== CarDeck 进程启动（本次日志起点）====="
+    const val SESSION_MARKER = "===== CarPToCarL 进程启动（本次日志起点）====="
+
+    /**
+     * 改名前的标记（应用曾叫 CarDeck）。**故意保留旧字符串**：设备上可能存着旧版本写的
+     * 日志文件，那时标记是旧名。只认新名会让这些文件退化成「无标记 = 返回全文」，
+     * 用户导出历史日志时反而多出大量无关内容。
+     */
+    internal const val LEGACY_SESSION_MARKER = "===== CarDeck 进程启动（本次日志起点）====="
 
     /**
      * 写入本次启动标记。由 [io.github.shaonialife.carptocar.SenderApp.onCreate] 调用一次；
@@ -50,8 +57,14 @@ object DebugFileLog {
      * 无标记 → 全文：旧版本写入的文件里没有标记，此时全量比空更好。
      */
     internal fun currentSessionSlice(text: String): String {
-        val markerAt = text.lastIndexOf(SESSION_MARKER)
-        return if (markerAt < 0) text else text.substring(markerAt + SESSION_MARKER.length)
+        // 新旧两种标记都认，取最靠后的那个：同一个文件里可能前半段是旧版本写的。
+        val best =
+            listOf(SESSION_MARKER, LEGACY_SESSION_MARKER)
+                .map { marker -> marker to text.lastIndexOf(marker) }
+                .filter { it.second >= 0 }
+                .maxByOrNull { it.second }
+                ?: return text
+        return text.substring(best.second + best.first.length)
     }
 
     fun append(

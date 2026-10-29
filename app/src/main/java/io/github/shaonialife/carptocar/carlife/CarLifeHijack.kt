@@ -10,7 +10,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 /**
  * 「本地劫持原生 CarLife」总控 —— **可选**的增强画面来源。
  *
- * 2026-10-24 产品方向变更：默认画面来源回归 **CarDeck 自绘桌面**（CarDeck 自己扮演
+ * 2026-10-24 产品方向变更：默认画面来源回归 **CarPToCarL 自绘桌面**（CarPToCarL 自己扮演
  * 「CarLife+ 发送端」的内容角色，协议仍是 CarPlay/AirPlay，见 SessionController
  * 的自绘分支）。本模块降级为 opt-in：只有用户在设置里打开「本地 CarLife 劫持」
  * 才会守候 7240 并接管原生 CarLife+ 码流。
@@ -61,7 +61,7 @@ object CarLifeHijack {
      * 一次性迁移标记 v1（历史）：曾把劫持对老安装强制开启一次。
      *
      * 2026-10-24 方向变更后被 v2 取代：v2 把被 v1 强开的劫持一次性关回去，
-     * 默认画面来源回归 CarDeck 自绘桌面。
+     * 默认画面来源回归 CarPToCarL 自绘桌面。
      */
     private const val KEY_MIGRATED_ON = "carlife_hijack_default_on_v1"
 
@@ -113,6 +113,18 @@ object CarLifeHijack {
     private var sender: VideoSender? = null
 
     private var audioSink: CarLifeAudioSink? = null
+
+    /**
+     * 导航 TTS 活跃截止时间（uptimeMillis）。每次收到 TTS PCM 就顺延 [TTS_SUPPRESS_TAIL_MS]；
+     * 媒体通道据此在窗口内丢弃音乐 PCM，实现「导航优先、车端只播导航」。
+     *
+     * @Volatile：TTS 读线程写、媒体读线程读。
+     */
+    @Volatile
+    private var ttsActiveUntil = 0L
+
+    /** 最后一个 TTS 包之后，继续压制音乐这么久（覆盖句内停顿，避免音乐闪回）。 */
+    private const val TTS_SUPPRESS_TAIL_MS = 1500L
 
     /**
      * TTS（导航播报）专用 sink。
@@ -529,7 +541,10 @@ object CarLifeHijack {
                 continue
             }
             announcedWait = false
-            val sink = CarLifeAudioSink(logSink ?: {})
+            val sink = CarLifeAudioSink(
+                logSink ?: {},
+                suppressWhen = { android.os.SystemClock.uptimeMillis() < ttsActiveUntil },
+            )
             audioSink = sink
             // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃（见字段注释）
             val naviSink = CarLifeAudioSink(logSink ?: {}, dropWhenPaused = false)
@@ -547,10 +562,14 @@ object CarLifeHijack {
                 onVideoParams = { w, h, f -> logSink?.invoke("CARLIFE: 手机编码参数 ${w}x$h@$f") },
                 onAudioFormat = { rate, channels -> sink.configure(rate, channels) },
                 onAudioPcm = { pcm, size -> routeAudio(sink, pcm, size) },
-                // 导航播报：TTS 通道独立格式、独立 sink；isTts=true 享最高优先级，
-                // 播报期间媒体让路（两路同时喂会把 RTP 时间戳推成两倍速）
+                // 导航播报：TTS 通道独立格式、独立 sink，喂给同一个音频发送端。
+                // isTts=true 享最高优先级；每来一包 TTS 顺延压制窗口，句内短停顿也保持音乐静默。
                 onTtsFormat = { rate, channels -> naviSink.configure(rate, channels) },
-                onTtsPcm = { pcm, size -> routeAudio(naviSink, pcm, size, isTts = true) },
+                onTtsPcm = { pcm, size ->
+                    // 顺延压制窗口（来自 fix/audio-tts-and-media-metadata）：覆盖句内停顿，避免音乐闪回
+                    ttsActiveUntil = android.os.SystemClock.uptimeMillis() + TTS_SUPPRESS_TAIL_MS
+                    routeAudio(naviSink, pcm, size)
+                },
                 onAudioGate = { active -> onEngineAudioGate(active) },
                 onMediaInfo = { info -> onMediaInfo(info) },
                 requestedFps = requestedFps,
@@ -888,34 +907,13 @@ object CarLifeHijack {
         sink: CarLifeAudioSink,
         pcm: ByteArray,
         size: Int,
-        isTts: Boolean = false,
     ) {
         val routed = io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true
         if (routed) {
-            val now = android.os.SystemClock.uptimeMillis()
-            if (isTts) {
-                ttsLastPacketAt = now
-                sink.write(0, 0, pcm, size)
-                return
-            }
-            // 媒体：播报期（含尾部保持窗）让路，避免两路样本串接导致时间轴翻倍
-            if (now - ttsLastPacketAt < TTS_HOLD_MS) {
-                mediaYieldedBytes += size
-                // 方案 A（2026-10-28 实机）：**不丢包，改喂等长静音**。
-                // 原先直接 return 丢弃，RTP 时间戳会少推进整整一段（实测一次播报丢 465KB≈2.4s），
-                // 播报结束后媒体从断点接上 = 时间轴突然跳过一段，jitter buffer 吃不满，
-                // 听感正是「导航开头几句卡顿」+ 接收端 deviceRestarts。
-                // 喂静音后样本数不变，时间轴线性推进，播报期仍是音乐静音（符合预期）。
-                sink.writeSilence(size)
-                if (now - lastTtsYieldLog >= AUDIO_DROP_LOG_MS) {
-                    lastTtsYieldLog = now
-                    logSink?.invoke(
-                        "CARLIFE: 导航播报中——媒体以静音占位让路（累计 ${mediaYieldedBytes / 1024}KB），播完自动恢复",
-                    )
-                    mediaYieldedBytes = 0
-                }
-                return
-            }
+            // 是否让路由 CarLifeAudioSink.suppressWhen 判定：
+            // 媒体 sink 在 ttsActiveUntil 窗口内写**等长静音**（保持 RTP 时间轴连续），
+            // TTS sink 未传该谓词，导航自己永不被抑制。
+            // 这里不再做第二层判断，避免两套窗口（700ms / 1500ms）互相叠加。
             sink.write(0, 0, pcm, size)
             return
         }
@@ -931,11 +929,25 @@ object CarLifeHijack {
         }
     }
 
-    /** 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。 */
+    /**
+     * 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。
+     *
+     * **只在元数据真的变了才广播**：实测（小米 CarLife+ 引擎 + **QQ音乐**）引擎会把
+     * 当前歌词行塞进 field 2 并**逐行**重推 0x10035，一首歌能推 217 次。若不去重，
+     * 每次都会打一条歌名日志并全量补推 0x5001，纯属浪费。
+     * 歌词变化不触发广播——车机侧也没有歌词字段可消费。
+     */
     private fun onMediaInfo(info: CarLifeMediaInfo) {
         latestMediaInfo = info
+        val key = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.size ?: 0}"
+        if (key == lastMediaInfoKey) return
+        lastMediaInfoKey = key
         mediaInfoListeners.forEach { runCatching { it(info) } }
     }
+
+    /** 上一次广播的媒体信息指纹（见 [onMediaInfo] 的去重说明）。 */
+    @Volatile
+    private var lastMediaInfoKey: String? = null
 
     // ---- 触控回传（车机 → 手机）----
 

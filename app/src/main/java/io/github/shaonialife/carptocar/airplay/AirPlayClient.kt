@@ -12,6 +12,7 @@ import io.github.shaonialife.carptocar.iap2.Iap2MessageIds
 import io.github.shaonialife.carptocar.iap2.Iap2SenderSession
 import io.github.shaonialife.carptocar.net.EndpointHosts
 import io.github.shaonialife.carptocar.util.DeviceIdentity
+import io.github.shaonialife.carptocar.util.SessionTrace
 import java.io.IOException
 import java.net.Inet6Address
 import java.net.InetAddress
@@ -582,6 +583,11 @@ class AirPlayClient(
                         "Content-Length: ${body.size}\r\n" +
                         "CSeq: $eventCseq\r\n\r\n"
                 val plaintext = head.toByteArray(Charsets.US_ASCII) + body
+                SessionTrace.rtsp(
+                    SessionTrace.Dir.TX,
+                    "airplay-event",
+                    head + SessionTrace.binary(body),
+                )
                 val bytes = cipher?.encrypt(plaintext) ?: plaintext
                 socket.getOutputStream().apply {
                     write(bytes)
@@ -611,6 +617,7 @@ class AirPlayClient(
                 val head =
                     "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n" +
                         (cseq?.let { "CSeq: $it\r\n" } ?: "") + "\r\n"
+                SessionTrace.rtsp(SessionTrace.Dir.TX, "airplay-event", head)
                 val plaintext = head.toByteArray(Charsets.US_ASCII)
                 socket.getOutputStream().apply {
                     write(cipher?.encrypt(plaintext) ?: plaintext)
@@ -1211,6 +1218,8 @@ class AirPlayClient(
                 } else if (messageCount % 100 == 0) {
                     log("$logPrefix: iAP2 msg #$messageCount id=0x${frame.messageId.toString(16)} body=${frame.body.size}B")
                 }
+                // 摘要只留前 20 条，录制全量：车机的订阅/状态推送正是靠这里进来
+                SessionTrace.csm(SessionTrace.Dir.RX, "airplay-iap", frame.messageId, frame.body)
                 onIapMessage?.invoke(frame)
             }
         }
@@ -2196,6 +2205,13 @@ class AirPlayClient(
                             }
                         var eventOtherLogged = 0
                         for (message in accumulator.offer(plain)) {
+                            // 完整会话录制：车机→手机的全部 RTSP（应答 + /command 请求）原文，
+                            // 含 status 行与 CSeq——拆链前车机最后说了什么，只能从这条时间线上看。
+                            SessionTrace.rtsp(
+                                SessionTrace.Dir.RX,
+                                "airplay-event",
+                                message.head + SessionTrace.binary(message.body),
+                            )
                             val firstLine = message.firstLine
                             // (a) 状态行（"RTSP/1.0 200 OK" 等）= 车机对**我们命令**的应答：
                             //     静默跳过——不回、不记录（回应答会触发乒乓回声，见 respondEventRequest）
@@ -2496,6 +2512,11 @@ class AirPlayClient(
                         "\r\n"
                 val plaintext = head.toByteArray(Charsets.US_ASCII) + body
                 val encryption = cipher
+                SessionTrace.rtsp(
+                    SessionTrace.Dir.TX,
+                    "airplay-ctrl",
+                    head + SessionTrace.binary(body),
+                )
                 val wire =
                     if (encryption != null) {
                         synchronized(encryption) { encryption.encrypt(plaintext) }

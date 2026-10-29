@@ -46,4 +46,30 @@ class DebugFileLogTest {
         val text = "[13:00:00.000] ${DebugFileLog.SESSION_MARKER}\n"
         assertEquals("\n", DebugFileLog.currentSessionSlice(text))
     }
+
+    @Test
+    fun legacyMarkerStillSlices() {
+        // 设备上可能存着改名前写下的日志文件（标记是旧名）。只认新名会让它退化成
+        // 「无标记 → 返回全文」，历史轮次的噪音全混进导出。
+        val text =
+            "old line\n" +
+                "[12:00:00.000] ${DebugFileLog.LEGACY_SESSION_MARKER}\n" +
+                "legacy session line\n"
+        val slice = DebugFileLog.currentSessionSlice(text)
+        assertTrue(slice.contains("legacy session line"))
+        assertTrue(!slice.contains("old line"))
+    }
+
+    @Test
+    fun newestOfBothMarkersWins() {
+        // 同一个文件里前半段旧版本、后半段新版本：必须取最靠后的那个标记
+        val text =
+            "[12:00:00.000] ${DebugFileLog.LEGACY_SESSION_MARKER}\n" +
+                "legacy line\n" +
+                "[13:00:00.000] ${DebugFileLog.SESSION_MARKER}\n" +
+                "current line\n"
+        val slice = DebugFileLog.currentSessionSlice(text)
+        assertTrue(slice.contains("current line"))
+        assertTrue(!slice.contains("legacy line"))
+    }
 }
