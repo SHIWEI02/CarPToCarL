@@ -546,7 +546,16 @@ object CarLifeHijack {
             val sink = CarLifeAudioSink(logSink ?: {})
             audioSink = sink
             // 导航播报走 TTS 通道（9241）：独立 sink、不参与暂停丢弃（见字段注释）
-            val naviSink = CarLifeAudioSink(logSink ?: {}, dropWhenPaused = false)
+            val naviSink =
+                CarLifeAudioSink(
+                    logSink ?: {},
+                    dropWhenPaused = false,
+                    // 独立播报流在线时 TTS 走它；否则回落主音频流（原有压制行为）
+                    senderProvider = {
+                        io.github.shaonialife.carptocar.SessionController.ttsAudioSender
+                            ?: io.github.shaonialife.carptocar.SessionController.audioSender
+                    },
+                )
             ttsSink = naviSink
             // 创建即应用当前播放状态：若此刻音乐已是 PAUSED，立刻截断（否则 listener 只在
             // 状态「变化」时触发，稳态 PAUSED 下新 sink 会漏掉这次联动）。
@@ -922,8 +931,10 @@ object CarLifeHijack {
         val routed = io.github.shaonialife.carptocar.SessionController.audioSender?.isRunning == true
         if (routed) {
             val now = android.os.SystemClock.uptimeMillis()
+            // 独立播报流在线：TTS 自己一条流，媒体全程不断，无需让路
+            val altOn = io.github.shaonialife.carptocar.SessionController.ttsAudioSender?.isRunning == true
             if (isTts) {
-                ttsLastPacketAt = now
+                if (!altOn) ttsLastPacketAt = now // 仅单流模式才需要压制媒体
                 sink.write(0, 0, pcm, size)
                 return
             }

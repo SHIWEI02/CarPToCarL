@@ -26,6 +26,13 @@ internal class CarLifeAudioSink(
      * （2026-10-27 日志：10:35:04 刚触发暂停丢弃，10:35:14 的导航 TTS 就来了）。
      */
     private val dropWhenPaused: Boolean = true,
+    /**
+     * 目标发送端来源。默认走会话主音频流；
+     * 导航 sink 传入「独立播报流优先、否则回落主音频流」的取值器。
+     */
+    private val senderProvider: () -> AudioSender? = {
+        io.github.shaonialife.carptocar.SessionController.audioSender
+    },
 ) {
     /** CarLife 引擎宣告的源采样率（CarlifeMusicInit；<=0 表示尚未宣告，按 48k 处理）。 */
     @Volatile
@@ -149,7 +156,7 @@ internal class CarLifeAudioSink(
                 if (channels > 0) channels else 2,
             )
         }
-        val sender = io.github.shaonialife.carptocar.SessionController.audioSender
+        val sender = senderProvider()
         if (sender == null || !sender.isRunning) return
         // 直通：交给 AudioSender 重采样 + 封包 + 发送
         sender.feedPcm(pcm, size, srcRate, srcChannels)

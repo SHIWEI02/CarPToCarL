@@ -4,6 +4,7 @@ import android.content.Context
 import android.view.KeyEvent
 import io.github.shaonialife.carptocar.airplay.AirPlayClient
 import io.github.shaonialife.carptocar.airplay.PairVerifyClient
+import io.github.shaonialife.carptocar.audio.AudioCodec
 import io.github.shaonialife.carptocar.audio.AudioProfile
 import io.github.shaonialife.carptocar.audio.AudioProfileMemory
 import io.github.shaonialife.carptocar.audio.AudioSender
@@ -432,6 +433,16 @@ object SessionController {
     @Volatile
     var audioSender: AudioSender? = null
 
+    /**
+     * 导航播报（TTS）**独立音频流**的发送端（CarPlay alt audio stream）。
+     *
+     * 非 null 时，TTS 走这条独立的流，媒体流保持 48k 立体声不被打断——
+     * 接收端自己做 ducking，不需要「媒体让路 + 写静音」。
+     * null = 未启用或协商失败，退回原有的单流+压制行为。
+     */
+    @Volatile
+    var ttsAudioSender: AudioSender? = null
+
     @Volatile
     var currentClient: AirPlayClient? = null
 
@@ -756,6 +767,8 @@ object SessionController {
         ScreenDimmer.setSessionActive(false)
         audioSender?.stop()
         audioSender = null
+        ttsAudioSender?.stop()
+        ttsAudioSender = null
         currentSharedSecret = null
         currentAudioHost = null
         currentHiddenSource?.release()
@@ -1603,6 +1616,7 @@ object SessionController {
                 false
             } else {
                 startCallWatcher(sender)
+                startAltAudioIfEnabled(client, secret = currentSharedSecret, host = host)
                 true
             }
         } catch (error: Exception) {
@@ -1611,6 +1625,81 @@ object SessionController {
             activeAudioProfile = null
             activeAudioStartedAt = 0L
             false
+        }
+    }
+
+    /**
+     * 为导航播报建立**独立音频流**（CarPlay alt audio stream）。
+     *
+     * 背景：CarLife 的导航 TTS 在 9241 上、常是 16kHz 单声道，而媒体在 9240 上是
+     * 48kHz 立体声。原实现把两路混进**同一条** type=102 流——每次播报都要把流格式
+     * 从 48k 切到 16k 再切回，边界必然 glitch；播报期间媒体还得让路写静音。
+     *
+     * 独立流解决方式：媒体流保持 48k 立体声全程不断，TTS 走自己的流，
+     * 由接收端做 ducking。CarPlay 原生就是这么设计的。
+     *
+     * 默认关闭（settings 里 `alt_audio_stream_enabled`），因为 alt 流 type 需要
+     * 按接收端实测确定（默认 108）。协商失败只记日志、不影响主链路。
+     */
+    private fun startAltAudioIfEnabled(
+        client: AirPlayClient,
+        secret: ByteArray?,
+        host: String,
+    ) {
+        val ctx = appContext?.applicationContext ?: return
+        val prefs = ctx.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("alt_audio_stream_enabled", false)) return
+        if (secret == null) {
+            appendLog("ALT-AUDIO: 未配对会话没有共享密钥——跳过独立播报流")
+            return
+        }
+        val altType = prefs.getInt("alt_audio_stream_type", 108).toLong().coerceIn(1L, 999L)
+        val altProfile = AudioProfile(
+            audioType = "media",
+            formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声
+            sampleRate = 48_000,
+            latencyMs = 250,
+            streamType = altType,
+            codec = AudioCodec.PCM,
+        )
+        appendLog("ALT-AUDIO: 尝试为导航播报协商独立流 type=$altType …")
+        Thread({
+            val info =
+                try {
+                    client.runAudioStream(secret, altProfile, AudioTuning.RAW_SPF)
+                } catch (error: Exception) {
+                    appendLog("ALT-AUDIO: 协商异常 ${error.message}")
+                    null
+                }
+            if (info == null) {
+                appendLog("ALT-AUDIO: ✗ type=$altType 被接收端拒绝——退回「单流 + 媒体写静音压制」")
+                return@Thread
+            }
+            val sender =
+                AudioSender(
+                    host = host,
+                    dataPort = info.dataPort,
+                    streamKey = info.streamKey,
+                    log = { line -> appendLog(line) },
+                    context = ctx,
+                    sampleRate = info.sampleRate,
+                    codec = AudioCodec.PCM,
+                    streamType = altType,
+                    adtsFrames = AudioTuning.RAW_SPF.adts,
+                    controlPort = info.controlPort,
+                )
+            if (sender.startPassthrough()) {
+                ttsAudioSender = sender
+                appendLog(
+                    "ALT-AUDIO: ✓ type=$altType 独立播报流建立 dataPort=${info.dataPort} " +
+                        "controlPort=${info.controlPort} connId=${info.streamConnectionId}",
+                )
+            } else {
+                appendLog("ALT-AUDIO: ✗ 独立播报流发送端启动失败——退回单流压制")
+            }
+        }, "alt-audio-setup").apply {
+            isDaemon = true
+            start()
         }
     }
 
