@@ -339,16 +339,21 @@ object SessionController {
      */
     private fun pushNowPlayingAll(force: Boolean = false) {
         var np = buildNowPlaying() ?: return
+        val key = "${np.title}|${np.artist}"
         // 封面：内容变了才换 ftid（否则每次 5s 进度补推都重发 20KB）。
         // 0x5001 里只带 ftid，JPEG 走 file-transfer 会话，两者必须成对更新。
+        //
+        // 同一首歌内只接受**更大**的图：CarLife 对同一首歌会先后推多张
+        // （实测 26463B 高清 → 2817B 低清占位，顺序不固定）。按「变化即换」
+        // 会把封面降级成糊图，还白传一次。
         val art = CarLifeHijack.latestMediaInfo?.albumArt?.takeIf { it.isNotEmpty() }
-        val artChanged = art != null && art.contentHashCode() != lastArtworkHash
-        if (artChanged) {
-            lastArtworkHash = art!!.contentHashCode()
-            artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
-        }
-        if (art != null) np = np.copy(artworkFtid = artworkFtid)
-        val key = "${np.title}|${np.artist}"
+        val sameTrack = key == lastArtworkKey
+        val artChanged =
+            art != null &&
+                art.contentHashCode() != lastArtworkHash &&
+                (!sameTrack || art.size > lastArtworkSize)
+        if (artChanged) artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
+        if (art != null && artworkFtid > 0) np = np.copy(artworkFtid = artworkFtid)
         if (!force && !artChanged && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
         currentClient?.pushNowPlaying()
@@ -356,9 +361,16 @@ object SessionController {
         bluetoothClient?.pushNowPlaying()
         if (artChanged && art != null) {
             val ok = currentClient?.pushArtwork(artworkFtid, art) ?: false
+            // 只在**成功发出后**才记账：否则无链路时会一直被当成「已推过」，
+            // 重连后不再补发，而 0x5001 仍在宣告 ftid —— 接收端有 id 无文件，封面永久空白。
+            if (ok) {
+                lastArtworkHash = art.contentHashCode()
+                lastArtworkSize = art.size
+                lastArtworkKey = key
+            }
             appendLog(
                 "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B → " +
-                    (if (ok) "已发出" else "无隧道链路/失败"),
+                    (if (ok) "已发出" else "无隧道链路/失败（下次补推）"),
             )
         }
     }
@@ -366,8 +378,14 @@ object SessionController {
     /** 当前封面在 file-transfer 会话上的文件 id（0 = 还没发过）。 */
     private var artworkFtid = 0
 
-    /** 上次推送的封面内容哈希，用来判断「换图了」。 */
+    /** 上次**成功发出**的封面内容哈希，用来判断「换图了」。 */
     private var lastArtworkHash = 0
+
+    /** 上次成功发出封面的字节数（同一首歌内只接受更大的图）。 */
+    private var lastArtworkSize = 0
+
+    /** 上次成功发出封面所属的曲目键（title|artist）。 */
+    private var lastArtworkKey: String? = null
 
     /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null
@@ -382,6 +400,12 @@ object SessionController {
      */
     fun resetNowPlayingDedupe() {
         lastPushedNowPlayingKey = null
+        // 封面同理：接收端重连后是新会话，之前传过的文件不算数。
+        // 不清这两个键会导致「重连后同一首歌封面一直空白」——artChanged 恒为 false
+        // 所以不再补传，但 0x5001 仍在宣告 artwork_ftid，接收端有 id 无文件。
+        lastArtworkHash = 0
+        lastArtworkKey = null
+        lastArtworkSize = 0
     }
 
     /**
