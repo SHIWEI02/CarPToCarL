@@ -392,33 +392,33 @@ object SessionController {
         // 掺进更早曲目的图（实测 18:32:58 把《我好想你》的 27274B 塞给《Dance Monkey》，
         // 而当时最近一次推送是 4363B 占位图，因此漏判 → 显示中间那首的封面）。
         val owner = artworkOwners[artHash]
-        val carryOver =
-            cached == null && !sameTrack && pid != null &&
+        // 「这张图不属于当前曲目」——两条独立证据，与是不是同一个曲目无关：
+        //   ① 归属表说它属于别的曲目；
+        //   ② 它就是上一个曲目最后一张图（CarLife 切歌时必发一遍）。
+        // 这里**不能**再要求 !sameTrack：缓存命中会先把本曲目绑定好，
+        // 紧接着上一首的图（或更早曲目的图）才姗姗来迟，若同曲目分支不查归属，
+        // 就会把它当成"本曲目的新图"收下。实测 18:48:24 半秒内连推三张：
+        //   19360B（缓存，正确）→ 23567B（别的曲目）→ 21135B（又一首）
+        val foreign =
+            cached == null && art != null && pid != null &&
                 (
-                    (prevRawArtHash != 0 && rawHash == prevRawArtHash && artworkTrackId != null) ||
-                        (owner != null && owner != pid)
+                    (owner != null && owner != pid) ||
+                        (prevRawArtHash != 0 && rawHash == prevRawArtHash && artworkTrackId != pid)
                 )
         // 同一张专辑内不同曲目合法共用同一张图（此时两张图本来就一样，不会显示错）。
         val ownerAlbum = owner?.let { pidAlbums[it] }
         val sameAlbum =
             !sameTrack && art != null &&
                 pid != null && info?.album?.isNotBlank() == true && info?.album == ownerAlbum
-        // 只要不是旧图，就把它记进归属表——**即使这一轮并不推送**。
-        // 目的：某首歌的真图可能在它当前播放时只是"到过"而没被采用（例如刚好赶上
-        // 缓存/去重），后面切到下一首时才又被 CarLife 补发一次；若当初没记账，
-        // 这张图到了新曲目名下就没有"前科"，会被当成新图收下——正是
-        // 「等封面时切歌，结果冒出上一首等的封面」。
-        if (raw != null && !carryOver && pid != null && artworkOwners[rawHash] == null) {
-            artworkOwners[rawHash] = pid
-        }
         val needUpload =
             when {
                 art == null -> false
                 cached != null -> true // 缓存命中的图必然属于该曲目
-                !sameTrack -> !carryOver || sameAlbum
-                else -> artHash != artworkHash
+                foreign && !sameAlbum -> false // 别人的图，除非同专辑合法共用
+                sameTrack -> artHash != artworkHash
+                else -> true
             }
-        if (art != null && !needUpload && !sameTrack && carryOver && lastSkipLoggedPid != pid) {
+        if (art != null && !needUpload && foreign && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
             appendLog(
                 "EVENT: 跳过封面 ${art.size}B（旧图未刷新，归属曲目 ${owner ?: "上一首"}）",
