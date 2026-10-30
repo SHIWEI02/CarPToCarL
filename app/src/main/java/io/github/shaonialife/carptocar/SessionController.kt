@@ -238,9 +238,9 @@ object SessionController {
                 pushNowPlayingAll(force = true)
             }
         }
-        // 数据源 D（反向）：车机拖动进度条 / 暂停 → 手机播放器真的跳转/暂停。
-        // 车机发的是 0x5002 SetNowPlayingInformation，本仓此前完全没接（收到都不记），
-        // 表现为「进度条能拖、松手弹回原处」。
+        // 数据源 D（反向）：车机拖动进度条 → 手机播放器真的跳转。
+        // 车机发的是 0x5003（载荷 `param(0, u32 毫秒)`，依据 WinPlay 源码），
+        // 本仓此前对 0x5002/0x5003 完全不处理（收到都不记），表现为「能拖、松手弹回」。
         Iap2NowPlaying.playbackCommandSink = { cmd ->
             cmd.elapsedMs?.let { ms ->
                 val ok = MediaSessionsState.seekTo(ms.toLong())
@@ -302,9 +302,9 @@ object SessionController {
         }
     }
 
-    /** 模拟一条车机下发的 0x5002（拖动到 [elapsedMs]）。 */
+    /** 模拟一条车机下发的 0x5003（拖动到 [elapsedMs]）。 */
     fun simulateRemoteSeek(elapsedMs: Int) {
-        val body = Iap2NowPlaying.buildPlaybackCommand(Iap2NowPlaying.STATUS_PLAYING, elapsedMs)
+        val body = Iap2NowPlaying.buildSeekBody(elapsedMs)
         val cmd = Iap2NowPlaying.parsePlaybackCommand(body)
         appendLog(
             "DEBUG: 模拟车机拖动进度 → 请求 ${elapsedMs}ms，" +

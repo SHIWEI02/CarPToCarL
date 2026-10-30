@@ -73,7 +73,13 @@ object Iap2NowPlaying {
         var repeat: Int? = null
         for (p in fields) {
             when (p.id) {
-                0x0000 -> if (p.value.size == 1) status = p.value[0].toInt() and 0xFF
+                // 0x5001 playback 组里 0x0000 是 status(u8)；0x5003 的 param 0 是
+                // 进度本身(u32)。**靠长度区分**，两种形态都能解出来。
+                0x0000 -> when (p.value.size) {
+                    1 -> status = p.value[0].toInt() and 0xFF
+                    4 -> elapsed = readU32(p.value)
+                }
+
                 0x0001 -> if (p.value.size == 4) elapsed = readU32(p.value)
                 0x0005 -> if (p.value.size == 1) shuffle = p.value[0].toInt() and 0xFF
                 0x0006 -> if (p.value.size == 1) repeat = p.value[0].toInt() and 0xFF
@@ -105,7 +111,7 @@ object Iap2NowPlaying {
             ((value[2].toInt() and 0xFF) shl 8) or
             (value[3].toInt() and 0xFF)
 
-    /** 构造一条 0x5002 参数体（供本地模拟拖动使用，与解析器对称）。 */
+    /** 构造一条 0x5002 参数体（播放/暂停，字段挂在 0x0001 组下）。 */
     fun buildPlaybackCommand(
         status: Int?,
         elapsedMs: Int?,
@@ -114,6 +120,23 @@ object Iap2NowPlaying {
         if (status != null) inner += Iap2Csm.u8(0x0000, status)
         if (elapsedMs != null) inner += Iap2Csm.u32(0x0001, elapsedMs.toLong())
         return Iap2Csm.param(0x0001, inner)
+    }
+
+    /**
+     * 构造一条 **0x5003 跳转位置**参数体：`param(0, u32 毫秒)`。
+     *
+     * 与 WinPlay `seek(ms){ send(0x5003,[param(0,u32(ms))]) }` 逐字节一致，
+     * 供本地模拟与单测使用。
+     */
+    fun buildSeekBody(elapsedMs: Int): ByteArray {
+        val value =
+            byteArrayOf(
+                (elapsedMs ushr 24).toByte(),
+                (elapsedMs ushr 16).toByte(),
+                (elapsedMs ushr 8).toByte(),
+                elapsedMs.toByte(),
+            )
+        return Iap2Csm.param(0x0000, value)
     }
 
     /**

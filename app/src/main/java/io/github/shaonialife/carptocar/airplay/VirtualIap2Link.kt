@@ -695,6 +695,23 @@ class VirtualIap2Link(
                 fireHidKeysLocked(usages)
             }
 
+            ids.SEEK_POSITION -> {
+                // 车机拖动进度条。载荷 `param(0, u32 毫秒)`——依据 WinPlay 源码
+                // （iap.ts:87 `seek(ms){send(0x5003,[param(0,u32(ms))])}`）。
+                // 不处理的表现是「进度条能拖、松手弹回原处」。
+                val seekMs = Iap2NowPlaying.parsePlaybackCommand(frame.body)?.elapsedMs
+                log(
+                    "IAPLINK: 车机 0x5003 拖动进度 → " +
+                        (seekMs?.let { "${it}ms" } ?: "解析不出") +
+                        " hex=" + frame.body.joinToString(" ") { "%02x".format(it) },
+                )
+                if (seekMs != null) {
+                    Iap2NowPlaying.playbackCommandSink?.invoke(
+                        Iap2NowPlaying.PlaybackCommand(status = null, elapsedMs = seekMs),
+                    )
+                }
+            }
+
             ids.SET_NOW_PLAYING_INFORMATION -> {
                 // 车机拖动进度条/暂停时下发。不处理的表现是「能拖、松手弹回」。
                 // 本仓此前完全没接这条：收到也不记，等于车机操作被静默丢弃。

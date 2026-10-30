@@ -62,15 +62,25 @@ object Iap2MessageIds {
     const val NOW_PLAYING_UPDATE = 0x5001
 
     /**
-     * 车机 → 手机：设置正在播放（播放/暂停/拖动进度）。
-     *
-     * 这个号不在 Apple 公开消息表里（本仓 0x1d01 解析时就把它列为「陌生 ID」），
-     * 但车机（含 MacPlay）的**发送清单**里明确包含它，且与 0x5001 的 playback 组同构：
-     * 顶层 param 0x0001 下挂 0x0000 status / 0x0001 elapsed。
-     * 解析实现见 [Iap2NowPlaying.parsePlaybackCommand]，真机报文体与假设不符时
-     * VirtualIap2Link 会把原始 hex 打进日志，据实修正即可。
+     * 车机 → 手机：设置正在播放（播放/暂停）。号码未见于 Apple 公开表，
+     * 但车机发送清单里同时声明了 0x5002/0x5003；按 WinPlay 源码，**0x5003 才是拖动进度**。
      */
     const val SET_NOW_PLAYING_INFORMATION = 0x5002
+
+    /**
+     * 车机 → 手机：**跳转播放位置**（拖动进度条）。
+     *
+     * 载荷：`param(0, u32 毫秒)`——单一顶层参数 0，大端 u32。
+     *
+     * 依据（实测源码，非推断）：开源接收端 WinPlay（Roylyl/WinPlay，GPL-3.0，
+     * 与 MacPlay 同作者）`src/engine/iap.ts:87`：
+     *
+     *     seek(ms:number){ this.send(0x5003,[param(0,u32(ms))]) }
+     *
+     * 其 UI（`src/ui/app.js`）的 seek 滑块拖完即调它。相比之下 MacPlay 源码里
+     * 完全没有 0x5003——它没有进度条，所以也发不出这条消息。
+     */
+    const val SEEK_POSITION = 0x5003
     const val START_ROUTE_GUIDANCE_UPDATES = 0x5200
     const val START_POWER_UPDATES = 0xAE00
     const val START_COMMUNICATIONS_UPDATES = 0x4157
@@ -102,6 +112,7 @@ object Iap2MessageIds {
             EA_SESSION_STATUS -> "EASessionStatus"
             START_NOW_PLAYING_UPDATES -> "StartNowPlayingUpdates"
             SET_NOW_PLAYING_INFORMATION -> "SetNowPlayingInformation"
+            SEEK_POSITION -> "SeekPosition"
             NOW_PLAYING_UPDATE -> "NowPlayingUpdate"
             START_ROUTE_GUIDANCE_UPDATES -> "StartRouteGuidanceUpdates"
             START_POWER_UPDATES -> "StartPowerUpdates"

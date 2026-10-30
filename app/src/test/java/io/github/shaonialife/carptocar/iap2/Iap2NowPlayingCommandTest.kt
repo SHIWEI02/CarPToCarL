@@ -1,5 +1,6 @@
 package io.github.shaonialife.carptocar.iap2
 
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -62,5 +63,42 @@ class Iap2NowPlayingCommandTest {
         // 用真实往返报文验证组被正确识别——否则 elapsed 永远解析不到。
         val body = Iap2NowPlaying.buildPlaybackCommand(Iap2NowPlaying.STATUS_PLAYING, 90_000)
         assertEquals("组内应被识别", 90_000, Iap2NowPlaying.parsePlaybackCommand(body)?.elapsedMs)
+    }
+
+    // ---- 0x5003：真正的拖动消息（依据 WinPlay 源码，非推断）----
+
+    @Test
+    fun `0x5003 按 param0 u32 解析出拖动位置`() {
+        val cmd = Iap2NowPlaying.parsePlaybackCommand(Iap2NowPlaying.buildSeekBody(75_000))
+        assertEquals(75_000, cmd?.elapsedMs)
+        assertNull("拖动不应带播放状态", cmd?.status)
+    }
+
+    @Test
+    fun `0x5003 报文与 WinPlay 逐字节一致`() {
+        // WinPlay iap.ts:87  seek(ms){ send(0x5003,[param(0,u32(ms))]) }
+        // param(0, u32(75000)) = 长度 8 | id 0 | 00 01 24 F8
+        val expected =
+            byteArrayOf(
+                0x00, 0x08, 0x00, 0x00,
+                0x00, 0x01, 0x24, 0xF8.toByte(),
+            )
+        assertArrayEquals(expected, Iap2NowPlaying.buildSeekBody(75_000))
+    }
+
+    @Test
+    fun `0x5003 的 param0 是四字节、不能误当状态`() {
+        // 0x5001 组里 param0 是 1 字节 status；0x5003 里 param0 是 4 字节进度。
+        // 解析器按长度区分，两者都要对。
+        val seek = Iap2NowPlaying.parsePlaybackCommand(Iap2NowPlaying.buildSeekBody(1_000))
+        assertEquals(1_000, seek?.elapsedMs)
+        assertNull(seek?.status)
+
+        val statusOnly =
+            Iap2NowPlaying.parsePlaybackCommand(
+                Iap2NowPlaying.buildPlaybackCommand(Iap2NowPlaying.STATUS_PAUSED, null),
+            )
+        assertEquals(Iap2NowPlaying.STATUS_PAUSED, statusOnly?.status)
+        assertNull(statusOnly?.elapsedMs)
     }
 }
