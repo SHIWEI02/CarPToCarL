@@ -69,6 +69,8 @@ class CarLifeHuClient(
     private val onAudioGate: (active: Boolean) -> Unit = {},
     /** 收到手机推送的媒体信息（歌名/歌手/封面，0x10035）。 */
     private val onMediaInfo: (info: CarLifeMediaInfo) -> Unit = {},
+    /** 收到媒体进度条（播放位置，毫秒）。供 iAP2 0x5001 的 elapsed 字段使用。 */
+    private val onMediaProgress: (progressMs: Int) -> Unit = {},
     private val connectTimeoutMs: Int = 3_000,
     /**
      * 向 CarLife 引擎申请的编码帧率（98311 的 fps 字段 + 98316 帧率变更）。
@@ -240,6 +242,12 @@ class CarLifeHuClient(
 
     /** 媒体信息原始字段探针已输出的条数（只需前几条即可核对字段语义）。 */
     private var mediaInfoProbeCount = 0
+
+    /** 媒体进度原始 hex 探针已输出条数。 */
+    private var mediaProgressProbeCount = 0
+
+    /** 媒体进度日志的计数（用于 10s 节流）。 */
+    private var mediaProgressLogCount = 0
 
     /** 已记录过的未处理控制消息 id（避免刷屏）。 */
     private val unknownLogged = HashSet<Int>()
@@ -676,17 +684,22 @@ class CarLifeHuClient(
             }
 
             CarLifeProtocol.MD_MEDIA_PROGRESS -> {
-                // 媒体进度条（u32 progressBar，单位 ms），暂只记录
-                val progress = if (payload.size >= 4) {
-                    ((payload[0].toInt() and 0xFF) shl 24) or
-                        ((payload[1].toInt() and 0xFF) shl 16) or
-                        ((payload[2].toInt() and 0xFF) shl 8) or
-                        (payload[3].toInt() and 0xFF)
-                } else {
-                    0
+                // 载荷是 protobuf `[0x08][varint 毫秒位置]`。旧实现把前 4 字节按 u32 大端读，
+                // 把 tag 0x08 当成数据高位，于是「进度」恒在 0x08000000~0x08FFFFFF（≈41 小时），
+                // 还与歌曲位置无关地来回跳——所以 0x5001 的 elapsed 一直只能写 0。
+                val progress = CarLifeProtocol.parseMediaProgress(payload)
+                if (mediaProgressProbeCount < MEDIA_INFO_PROBE_LIMIT) {
+                    mediaProgressProbeCount++
+                    log(
+                        "CARLIFE: 媒体进度原始（${payload.size}B）hex=" +
+                            payload.take(8).joinToString(" ") { "%02x".format(it) } +
+                            " → ${progress}ms",
+                    )
                 }
-                log("CARLIFE: 媒体进度 ${progress}ms")
+                onMediaProgress(progress)
                 lastMediaProgressAt = android.os.SystemClock.uptimeMillis()
+                // 每秒一条太吵，约 10s 记一次，够确认进度在走。
+                if (mediaProgressLogCount++ % 10 == 0) log("CARLIFE: 媒体进度 ${progress}ms")
             }
 
             in CarLifeProtocol.MD_IGNORED_IDS -> {

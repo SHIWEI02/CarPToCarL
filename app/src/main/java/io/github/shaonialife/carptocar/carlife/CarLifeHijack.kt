@@ -578,6 +578,7 @@ object CarLifeHijack {
                 onTtsPcm = { pcm, size -> routeAudio(naviSink, pcm, size, isTts = true) },
                 onAudioGate = { active -> onEngineAudioGate(active) },
                 onMediaInfo = { info -> onMediaInfo(info) },
+                onMediaProgress = { ms -> onMediaProgress(ms) },
                 requestedFps = requestedFps,
                 connectType = connectType,
                 probeIds = probeIds,
@@ -983,6 +984,52 @@ object CarLifeHijack {
      */
     @Volatile
     private var lastMediaFingerprint: String? = null
+
+    /** 最近一次收到的播放位置（毫秒，来自 CarLife 0x10036）。 */
+    @Volatile
+    var latestMediaProgressMs: Int = 0
+        private set
+
+    /** 该位置的采样时刻（elapsedRealtime），用于按播放速度外推。 */
+    @Volatile
+    private var mediaProgressAnchorAt = 0L
+
+    /** 进度变化监听（由 SessionController 挂上，用于节流补推 0x5001）。 */
+    @Volatile
+    var mediaProgressListener: ((progressMs: Int) -> Unit)? = null
+
+    /**
+     * 收到 CarLife 媒体进度（0x10036，protobuf `[0x08][varint ms]`）。
+     *
+     * 只做记录与外推锚点：进度每秒一条，真机实测同一首歌内逐秒递增；
+     * 换歌时会回跳，锚点随之重置，不会把上曲的位置带到新曲。
+     */
+    private fun onMediaProgress(progressMs: Int) {
+        latestMediaProgressMs = progressMs
+        mediaProgressAnchorAt = android.os.SystemClock.elapsedRealtime()
+        mediaProgressListener?.let { runCatching { it(progressMs) } }
+    }
+
+    /**
+     * 当前播放位置（毫秒）：以最近一条进度为基准，按经过时间外推并钳制在时长内。
+     *
+     * 接收端（车机）只在收到 0x5001 时刷新进度条，两次推送之间靠自己外推；
+     * 这里给出「此刻」的位置，避免车机进度条停在上一帧。
+     *
+     * @param durationMs 曲目时长；<=0 时不做上限钳制。
+     */
+    fun currentMediaElapsedMs(durationMs: Int): Int {
+        val base = latestMediaProgressMs
+        if (base <= 0) return 0
+        val anchor = mediaProgressAnchorAt
+        val advanced =
+            if (anchor > 0L) {
+                base + (android.os.SystemClock.elapsedRealtime() - anchor).toInt()
+            } else {
+                base
+            }
+        return if (durationMs > 0) advanced.coerceIn(0, durationMs) else advanced.coerceAtLeast(0)
+    }
 
     /** 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。 */
     private fun onMediaInfo(info: CarLifeMediaInfo) {

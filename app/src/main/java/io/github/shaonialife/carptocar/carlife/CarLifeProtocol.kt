@@ -624,6 +624,40 @@ internal object CarLifeProtocol {
         return out.toString().trim()
     }
 
+    /**
+     * 解析媒体进度条（`MD_MEDIA_PROGRESS`）载荷为毫秒播放位置。
+     *
+     * 载荷是 protobuf：`[0x08][varint progressMs]`。
+     *
+     * 旧实现把前 4 字节按 u32 大端读，把 tag `0x08` 也当成了数据高位——实测值恒落在
+     * `0x08000000`~`0x08FFFFFF`（134.2M~151.0M，≈41 小时），且随 varint 低位来回跳。
+     * 按 varint 解码（`08 AE CE 09` → 157486）才与播放位置吻合。
+     */
+    fun parseMediaProgress(payload: ByteArray): Int {
+        var index = 0
+        while (index < payload.size) {
+            val tag = payload[index].toInt() and 0xFF
+            index++
+            val field = tag ushr 3
+            val wireType = tag and 0x07
+            when (wireType) {
+                0 -> {
+                    val value = readVarint(payload, index)
+                    index += varintLen(payload, index)
+                    if (field == 1) return value.coerceAtLeast(0)
+                }
+
+                2 -> {
+                    val length = readVarint(payload, index)
+                    index += varintLen(payload, index) + length
+                }
+
+                else -> return 0
+            }
+        }
+        return 0
+    }
+
     private fun readVarint(
         payload: ByteArray,
         index: Int,

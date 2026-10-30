@@ -229,7 +229,23 @@ object SessionController {
             )
             pushNowPlayingAll()
         }
+        // 数据源 C：播放进度（0x10036）——车机进度条依赖 0x5001 的 elapsed 刷新。
+        // 进度本身每秒一条；补推按 5s 节流，避免车机侧进度条反复重绘。
+        CarLifeHijack.mediaProgressListener = {
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (now - lastProgressPushAt >= PROGRESS_PUSH_INTERVAL_MS) {
+                lastProgressPushAt = now
+                pushNowPlayingAll(force = true)
+            }
+        }
     }
+
+    /** 上次因进度变化补推 0x5001 的时刻（elapsedRealtime）。 */
+    @Volatile
+    private var lastProgressPushAt = 0L
+
+    /** 进度补推节流间隔。 */
+    private const val PROGRESS_PUSH_INTERVAL_MS = 5_000L
 
     /**
      * 歌名变化：同时补推 WiFi 隧道（currentClient）与蓝牙链路（server/client）。
@@ -237,11 +253,13 @@ object SessionController {
      * 去重保护：部分播放器（荣耀音乐等）会把「逐行歌词」写进 MediaSession title，
      * 导致每秒多次内容变化、且同一行会因多触发源（1s 轮询 + 会话回调 + metadata 回调）
      * 重复 publish。这里按 title+artist 去重，只在真正切歌/切歌词行时推一次。
+     *
+     * @param force 进度条刷新用：跳过 title|artist 去重，但仍更新去重键。
      */
-    private fun pushNowPlayingAll() {
+    private fun pushNowPlayingAll(force: Boolean = false) {
         val np = buildNowPlaying() ?: return
         val key = "${np.title}|${np.artist}"
-        if (key == lastPushedNowPlayingKey) return
+        if (!force && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
         currentClient?.pushNowPlaying()
         bluetoothServer?.pushNowPlaying()
@@ -296,15 +314,17 @@ object SessionController {
             )
         }
         val info = CarLifeHijack.latestMediaInfo ?: return null
+        // CarLife 0x10035 的 duration 单位是**秒**（实测 QQ音乐 204 = 3:24），
+        // 旧代码直接当毫秒用，4 分钟的歌在车机上显示成 204ms。
+        val durationMs = info.duration.coerceIn(0, 86_400) * 1000
         return CarPlayNowPlaying(
             title = info.song.takeIf { it.isNotBlank() },
             artist = info.artist.takeIf { it.isNotBlank() },
             album = info.album.takeIf { it.isNotBlank() },
-            // CarLife 0x10035 的 duration 单位是**秒**（实测 QQ音乐 204 = 3:24），
-            // 旧代码直接当毫秒用，4 分钟的歌在车机上显示成 204ms。
-            durationMs = (info.duration.coerceIn(0, 86_400) * 1000),
+            durationMs = durationMs,
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
-            elapsedMs = 0,
+            // 播放位置来自 0x10036（protobuf varint 毫秒），以最近一条为锚点外推。
+            elapsedMs = CarLifeHijack.currentMediaElapsedMs(durationMs),
             appName = info.source.takeIf { it.isNotBlank() },
         )
     }
