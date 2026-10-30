@@ -419,6 +419,11 @@ object SessionController {
                 // 播放位置来自 0x10036（protobuf varint 毫秒），以最近一条为锚点外推。
                 elapsedMs = CarLifeHijack.currentMediaElapsedMs(durationMs),
                 appName = carlifeInfo.source.takeIf { it.isNotBlank() },
+                // 曲目持久 id：CarLife 的 songId 是数字串，直接用；取不到时用歌名哈希兜底。
+                // 接收端靠它把封面绑到曲目上，缺了就「收到图但挂不上」。
+                persistentId =
+                    carlifeInfo.songId.toLongOrNull()
+                        ?: (carlifeInfo.song.hashCode().toLong() and 0xFFFF_FFFFL),
             )
         }
         // 劫持在跑 = 手机音频走 CarLife，此时 MediaSession 只是同一首歌的**更差副本**

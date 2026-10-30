@@ -518,7 +518,10 @@ class VirtualIap2Link(
                 jpeg.copyInto(datagram, 2, from, to)
                 if (engine.sendFileTransfer(datagram, System.nanoTime() / 1_000_000L)) sent++
             }
-            log("IAPLINK: 推送封面 ftid=$ftid ${jpeg.size}B（$chunks 片，成功 $sent）")
+            log(
+                "IAPLINK: 推送封面 ftid=$ftid ${jpeg.size}B（$chunks 片，成功 $sent）" +
+                    " 链路=${engine.debugState} 已写帧=${engine.fileTransferFramesSent}",
+            )
             return sent == chunks
         }
     }

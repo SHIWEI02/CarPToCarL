@@ -34,6 +34,15 @@ data class CarPlayNowPlaying(
      * null = 本曲没有封面可发。
      */
     val artworkFtid: Int? = null,
+    /**
+     * 曲目持久 id（媒体项属性 0，u64）。
+     *
+     * 封面必须挂在这条 id 上：接收端拿它作为「曲目标识」，把随后 file-transfer 收到的
+     * JPEG 关联到当前曲目（MacPlay `driver.rs`：`art_tags.track = persistent_id`，
+     * 再 `advertised.insert(artwork_ftid, art_tags.track)`）。缺了它，封面即使收全了
+     * 也无处归属，Now Playing 依旧空白。
+     */
+    val persistentId: Long? = null,
 )
 
 object Iap2NowPlaying {
@@ -122,6 +131,19 @@ object Iap2NowPlaying {
         return consumed == value.size
     }
 
+    /** 大端 u64 的参数值（媒体项属性 0 persistent_id）。 */
+    private fun u64(value: Long): ByteArray =
+        byteArrayOf(
+            (value ushr 56).toByte(),
+            (value ushr 48).toByte(),
+            (value ushr 40).toByte(),
+            (value ushr 32).toByte(),
+            (value ushr 24).toByte(),
+            (value ushr 16).toByte(),
+            (value ushr 8).toByte(),
+            value.toByte(),
+        )
+
     private fun readU32(value: ByteArray): Int =
         ((value[0].toInt() and 0xFF) shl 24) or
             ((value[1].toInt() and 0xFF) shl 16) or
@@ -185,7 +207,9 @@ object Iap2NowPlaying {
         //  - 从没发过 13 set_elapsed_available，接收端据此判定「不可跳转」→ 进度条整个禁用
         //    （MacPlay.swift:424 用 canSeek && duration>0 决定是否启用拖动）。
         val mediaItem =
-            Iap2Csm.string(0x0001, np.title.orEmpty()) +
+            // 0 = persistent_id(u64)：封面归属的曲目标识，接收端据此把 artwork_ftid 绑到曲目。
+            (np.persistentId?.let { Iap2Csm.param(0x0000, u64(it)) } ?: ByteArray(0)) +
+                Iap2Csm.string(0x0001, np.title.orEmpty()) +
                 Iap2Csm.u32(0x0004, np.durationMs.toLong()) +
                 Iap2Csm.string(0x0006, np.album.orEmpty()) +
                 Iap2Csm.string(0x000C, np.artist.orEmpty()) +

@@ -110,6 +110,14 @@ class Iap2LinkEngine(
 
     var state: State = State.IDLE
         private set
+
+    /** 真正写到链路上的 file-transfer（session 12）帧数——诊断「入队」与「发出」的区别用。 */
+    var fileTransferFramesSent: Long = 0
+        private set
+
+    /** 诊断串：链路状态 + 发送积压。 */
+    val debugState: String get() = "$state backlog=${sendBacklog.size}"
+
     var peerSynchronization: SynchronizationPayload? = null
         private set
 
@@ -749,6 +757,7 @@ class Iap2LinkEngine(
         sessionId: Int,
     ) {
         if (state == State.DEAD) return
+        if (sessionId == SESSION_FILE_TRANSFER) fileTransferFramesSent++
         onFrameSent?.invoke(control, sequence, lastReceivedInOrder, sessionId, payload?.size ?: 0)
         val length = payload?.size?.plus(HEADER_BYTES + 1) ?: HEADER_BYTES
         val frame = ByteArray(length)
