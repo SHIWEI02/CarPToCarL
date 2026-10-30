@@ -137,6 +137,23 @@ object CarLifeHijack {
     private var latestMediaInfoAt = 0L
 
     /**
+     * 最近一条**字段完整**的媒体信息（artist 非空）。
+     *
+     * 必须单独留存：CarLife 切歌瞬间会推 1~2 条残缺帧（field 3 只有歌手、
+     * 没有「歌名-歌手」合并串），此时 `song` 其实是歌手名。
+     *
+     * 这个坑很隐蔽——推送入口虽然跳过了残缺帧，但**链路发送时会重新调用
+     * buildNowPlaying() 取 np**（VirtualIap2Link.pushNowPlaying → nowPlayingProvider），
+     * 那条路径读的是 latestMediaInfo，于是残缺帧照样出网：
+     *   实测 18:32 车机上出现 `歌名=郁可唯 歌手=?`，
+     *   18:36~18:38 曲目 id 在两三个值之间来回跳，封面随之反复重推。
+     * 所以下游（buildNowPlaying）只能读这个「完整版」。
+     */
+    @Volatile
+    var latestCompleteMediaInfo: CarLifeMediaInfo? = null
+        private set
+
+    /**
      * 媒体信息是否「新鲜」（默认 10 秒内更新过）。
      *
      * 用于决定 0x5001 该采信谁：CarLife 侧字段干净（歌名/歌手/专辑/时长都对），
@@ -1055,6 +1072,8 @@ object CarLifeHijack {
         // 无论是否重复都要更新缓存：进度/歌词变化时 latestMediaInfo 仍应是最新的。
         latestMediaInfo = info
         latestMediaInfoAt = android.os.SystemClock.elapsedRealtime()
+        // 残缺帧（artist 为空）只更新原始缓存，不进「完整版」——后者才允许出网。
+        if (!info.partial) latestCompleteMediaInfo = info
         // 指纹用封面**内容哈希**而不是字节数：CarLife 重新编码同一张图时字节数可能不变
         // 而内容不同，比字节数会漏掉这次变化，导致要等 5s 的进度补推才更新封面。
         val fingerprint = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.contentHashCode() ?: 0}"
