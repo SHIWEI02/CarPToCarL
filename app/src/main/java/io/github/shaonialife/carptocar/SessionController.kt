@@ -1605,7 +1605,7 @@ object SessionController {
         return try {
             val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
             // RTP 冗余级数：settings.audio_rtp_redundancy（0=关，1..7=级数）。见 AudioSender。
-            val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 0).coerceIn(0, 7)
+            val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 1).coerceIn(0, 7)
             // 车机身份 → 只用于「本车机哪些音频档位踩过雷」的持久化记忆。
             val identity = client.receiverIdentity()
             // 音频封装参数已定案（见 AudioTuning），不再提供切换
