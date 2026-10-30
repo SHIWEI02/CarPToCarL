@@ -404,7 +404,6 @@ object SessionController {
         // 必须按**图本身的归属**判断，不能只跟最近一次推送比：连续快切时它会同时
         // 掺进更早曲目的图（实测 18:32:58 把《我好想你》的 27274B 塞给《Dance Monkey》，
         // 而当时最近一次推送是 4363B 占位图，因此漏判 → 显示中间那首的封面）。
-        val owner = artworkOwners[artHash]
         // 「这张图不属于当前曲目」——两条独立证据，与是不是同一个曲目无关：
         //   ① 归属表说它属于别的曲目；
         //   ② 它就是上一个曲目最后一张图（CarLife 切歌时必发一遍）。
@@ -412,12 +411,51 @@ object SessionController {
         // 紧接着上一首的图（或更早曲目的图）才姗姗来迟，若同曲目分支不查归属，
         // 就会把它当成"本曲目的新图"收下。实测 18:48:24 半秒内连推三张：
         //   19360B（缓存，正确）→ 23567B（别的曲目）→ 21135B（又一首）
+        // ── 混帧识别 ────────────────────────────────────────────────
+        // CarLife 在快速切换时会把两首歌的字段拼进同一帧：`song` 已经换成新歌，
+        // 而 `art`/`dur`/`lyric` 还留在上一首。这类帧的 lyric 一定是占位形式
+        // 「歌名 - 歌手」，且那个歌名不是本帧的 song。
+        // 实测 18:54（梦醒时分 226s / 阿拉善 306s 互切）：
+        //   .416 song=阿拉善    dur=226(梦醒)   art=25223  lyric=梦醒时分 - 伍佰
+        //   .046 song=梦醒时分  dur=306(阿拉善)  art=18758  lyric=阿拉善 - 贰佰
+        // 照单全收就把两首歌的封面互换了；稳定后 .447 的
+        //   song=阿拉善 dur=306 art=18758 lyric=词：贰佰 才说明 18758 是阿拉善的。
+        val lyricTitle = info?.lyric?.substringBefore(" - ")?.trim().orEmpty()
+        // 歌名 → 曲目 id（用于把混帧里的图直接判给它真正的主人）
+        if (pid != null && info != null && info.song.isNotBlank()) {
+            titleToPid[info.song.trim()] = pid
+        }
+        val mixedFrame =
+            info != null && info.lyric.contains(" - ") &&
+                lyricTitle.isNotEmpty() && lyricTitle != info.song.trim()
+        // 混帧的 lyric 就写着这张图真正属于哪首歌 —— 直接按它登记归属。
+        // 否则 A 的图会先被 B 认领，两首歌的封面就此互换（18:54 梦醒时分/阿拉善）。
+        if (mixedFrame && rawHash != 0) {
+            titleToPid[lyricTitle]?.let { artworkOwners[rawHash] = it }
+        }
+        val owner = artworkOwners[artHash]
         val foreign =
             cached == null && art != null && pid != null &&
                 (
                     (owner != null && owner != pid) ||
                         (prevArtHashes.contains(rawHash) && artworkTrackId != pid)
                 )
+        // 「一直被指向某个曲目」的自愈：归属表也可能是错的（混帧会把 A 的图记到 B）。
+        // 若同一张图连续 3 帧都被当前曲目指向，就改判给它——约 6 秒内自愈。
+        if (foreign && !sameTrack && pid != null && rawHash != 0) {
+            if (rawHash == streakHash && pid == streakPid) {
+                streakCount++
+            } else {
+                streakHash = rawHash
+                streakPid = pid
+                streakCount = 1
+            }
+        } else {
+            streakHash = 0
+            streakPid = null
+            streakCount = 0
+        }
+        val foreignOverride = streakCount >= 3
         // 归属优先：只要这张图已经属于别的曲目，一律不采用。
         // 早期放了「同专辑可共用」的例外，实测被脏数据钻空——CarLife 的 album 字段
         // 在切歌时会短暂沿用上一首，于是"同专辑"成立、别人的图被收下
@@ -426,11 +464,19 @@ object SessionController {
         val needUpload =
             when {
                 art == null -> false
+                mixedFrame && cached == null -> false // 混帧里的图不采信
                 cached != null -> true // 缓存命中的图必然属于该曲目
-                foreign -> false
+                foreign && !foreignOverride -> false
                 sameTrack -> artHash != artworkHash
                 else -> true
             }
+        if (foreign && foreignOverride && !sameTrack) {
+            appendLog("EVENT: 封面改判 ${art?.size}B → 曲目 $pid（连续 $streakCount 帧都指向它）")
+            if (pid != null && rawHash != 0) {
+                artworkOwners[rawHash] = pid
+                streakCount = 0
+            }
+        }
         if (art != null && !needUpload && foreign && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
             appendLog(
@@ -534,6 +580,17 @@ object SessionController {
     /** 已就「跳过旧封面」打过日志的曲目，避免每个进度周期刷屏。 */
     private var lastSkipLoggedPid: Long? = null
 
+    /** 歌名 → 曲目 id（混帧里用 lyric 的歌名反查图的主人）。 */
+    private val titleToPid =
+        object : LinkedHashMap<String, Long>(32, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?) = size > 32
+        }
+
+    /** 连续「同一张图被同一曲目指向」的计数与对象（归属表自愈用）。 */
+    private var streakHash = 0
+    private var streakPid: Long? = null
+    private var streakCount = 0
+
     /** 当前正在观察的曲目 id。 */
     private var seenPid: Long? = null
 
@@ -569,6 +626,10 @@ object SessionController {
         seenPid = null
         seenHashes.clear()
         prevArtHashes.clear()
+        streakHash = 0
+        streakPid = null
+        streakCount = 0
+        titleToPid.clear()
         lastSkipLoggedPid = null
     }
 
