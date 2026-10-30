@@ -675,7 +675,12 @@ class Iap2LinkEngine(
             val packet = sendBacklog.first()
             val peer = peerSynchronization
             val window = declaredMaxOutgoing
-            if (lastSentAcknowledged != null &&
+            // 窗口只限制「要等对端确认」的帧。发后不管的帧（文件传输/部分 CSM）
+            // 按定义不会被确认，却同样占用窗口额度——一旦队头有未确认的控制帧，
+            // 它们就永远卡在 backlog 里。实测 18:57：已写帧停在 140 不动，
+            // backlog 34→61 持续增长，封面文件一片都没发出去，车机上直接没封面。
+            if (packet.awaitAck &&
+                lastSentAcknowledged != null &&
                 sequenceDistance(sentSequence, lastSentAcknowledged!!) >= window
             ) {
                 return
