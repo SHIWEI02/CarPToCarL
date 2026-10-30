@@ -17,6 +17,7 @@ import io.github.shaonialife.carptocar.bt.Iap2BluetoothServer
 import io.github.shaonialife.carptocar.bt.TargetDevicePrefs
 import io.github.shaonialife.carptocar.capture.HiddenDisplaySource
 import io.github.shaonialife.carptocar.carlife.CarLifeHijack
+import io.github.shaonialife.carptocar.carlife.CarLifeMediaInfo
 import io.github.shaonialife.carptocar.iap2.CarPlayNowPlaying
 import io.github.shaonialife.carptocar.iap2.Iap2MessageIds
 import io.github.shaonialife.carptocar.iap2.Iap2NowPlaying
@@ -338,7 +339,7 @@ object SessionController {
      * @param force 进度条刷新用：跳过 title|artist 去重，但仍更新去重键。
      */
     private fun pushNowPlayingAll(force: Boolean = false) {
-        var np = buildNowPlaying() ?: return
+        val np = buildNowPlaying() ?: return
         val info = CarLifeHijack.latestMediaInfo
         val pid = np.persistentId
         val key = "${np.title}|${np.artist}"
@@ -367,47 +368,72 @@ object SessionController {
         val sameAlbum =
             !sameTrack && art != null &&
                 !info?.album.isNullOrBlank() && info?.album == lastArtworkAlbum
-        val artChanged =
+        val needUpload =
             when {
                 art == null -> false
                 sameTrack -> hashDiffers && art.size > lastArtworkSize // 同曲目：只接受更大的
                 else -> hashDiffers || sameAlbum // 换曲目：新图，或同专辑合法共用
             }
-        if (art != null && !artChanged && !sameTrack && !hashDiffers && lastSkipLoggedPid != pid) {
+        if (art != null && !needUpload && !sameTrack && !hashDiffers && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
             appendLog("EVENT: 跳过封面 ${art.size}B（与上一首完全相同，判定为未刷新的旧图）")
         }
-        if (artChanged) artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
-        // 只宣告「属于当前曲目」的 ftid：换曲目后若还没拿到新图，宁可不宣告
-        // （接收端换曲目时自己会清空封面），也不能宣告上一首的 id——那会让
-        // 车机保留上一首的封面（「切歌后封面还是之前的」）。
-        val advertised =
-            when {
-                artChanged -> artworkFtid
-                sameTrack -> artworkFtid
-                else -> null
-            }
-        if (advertised != null) np = np.copy(artworkFtid = advertised)
-        if (!force && !artChanged && key == lastPushedNowPlayingKey) return
+        // 先把「新 ftid 已绑定到本曲目」记下来，再推 0x5001：各条链路发送时会重新
+        // 调用 buildNowPlaying()（见 nowPlayingProvider），只有 artworkTrackId 已指向
+        // pid，它才会把 ftid 带上。这里不 copy np——那个副本根本不会出网。
+        if (needUpload) {
+            artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
+            artworkTrackId = pid
+            lastArtworkHash = art!!.contentHashCode()
+            lastArtworkSize = art.size
+            lastArtworkAlbum = info?.album.orEmpty()
+        }
+        if (!force && !needUpload && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
         currentClient?.pushNowPlaying()
         bluetoothServer?.pushNowPlaying()
         bluetoothClient?.pushNowPlaying()
-        if (artChanged && art != null) {
+        if (needUpload && art != null) {
             val ok = currentClient?.pushArtwork(artworkFtid, art) ?: false
-            // 只在**成功发出后**才记账：否则无链路时会一直被当成「已推过」，
-            // 重连后不再补发，而 0x5001 仍在宣告 ftid —— 接收端有 id 无文件，封面永久空白。
-            if (ok) {
-                lastArtworkHash = art.contentHashCode()
-                lastArtworkSize = art.size
-                artworkTrackId = pid
-                lastArtworkAlbum = info?.album.orEmpty()
+            // 发不出去就回滚绑定：否则这一轮宣告了 ftid 却没有文件，接收端有 id 无图；
+            // 回滚后下一轮会分配新 ftid 重试。
+            if (!ok) {
+                artworkTrackId = null
+                lastArtworkHash = 0
+                lastArtworkSize = 0
             }
             appendLog(
                 "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid → " +
                     (if (ok) "已发出" else "无隧道链路/失败（下次补推）"),
             )
         }
+    }
+
+    /**
+     * 本曲目已绑定且已发出的封面 ftid；没有就返回 null（不宣告）。
+     *
+     * 接收端以 `coverKey(ftid, trackID)` 双键存图，所以只在「该 ftid 确实属于该曲目」时
+     * 才宣告；换曲目后若还没拿到新图，一个 id 都不给——接收端换曲目时自己会清空封面，
+     * 宁可空白，也不要把上一首的图挂上去。
+     */
+    private fun boundArtworkFtid(pid: Long?): Int? =
+        artworkFtid.takeIf { it > 0 && pid != null && artworkTrackId == pid }
+
+    /**
+     * 曲目持久 id（iAP2 媒体项属性 0）。
+     *
+     * **不能用 0x10035 的 field 8**：实测它与时长毫秒逐位吻合——《人来人往》234769
+     * (234s)、《樱花草》288533 (288s)，且**同一首歌会跳变**（先 231026，后 288533，
+     * 对应时长从 231s 修正为 288s）。拿它当曲目 id，等于引擎一改时长就把同一首歌
+     * 判成两首，封面被当成「换曲目」反复作废重传——这是切歌后迟迟不出图的成因之一。
+     *
+     * 改用「歌名|歌手」的 64 位稳定哈希：同一首歌恒定，换歌即变。
+     */
+    private fun persistentIdOf(info: CarLifeMediaInfo): Long {
+        val text = info.song.trim() + "|" + info.artist.trim()
+        val hi = text.hashCode().toLong() and 0xFFFF_FFFFL
+        val lo = text.reversed().hashCode().toLong() and 0xFFFF_FFFFL
+        return ((hi shl 32) or lo) or 1L // 避开 0（接收端以 null/0 表示「无」）
     }
 
     /** 当前封面在 file-transfer 会话上的文件 id（0 = 还没发过）。 */
@@ -477,6 +503,7 @@ object SessionController {
             // CarLife 0x10035 的 duration 单位是**秒**（实测 QQ音乐 204 = 3:24），
             // 旧代码直接当毫秒用，4 分钟的歌在车机上显示成 204ms。
             val durationMs = carlifeInfo.duration.coerceIn(0, 86_400) * 1000
+            val pid = persistentIdOf(carlifeInfo)
             return CarPlayNowPlaying(
                 title = carlifeInfo.song.takeIf { it.isNotBlank() },
                 artist = carlifeInfo.artist.takeIf { it.isNotBlank() },
@@ -486,11 +513,15 @@ object SessionController {
                 // 播放位置来自 0x10036（protobuf varint 毫秒），以最近一条为锚点外推。
                 elapsedMs = CarLifeHijack.currentMediaElapsedMs(durationMs),
                 appName = carlifeInfo.source.takeIf { it.isNotBlank() },
-                // 曲目持久 id：CarLife 的 songId 是数字串，直接用；取不到时用歌名哈希兜底。
-                // 接收端靠它把封面绑到曲目上，缺了就「收到图但挂不上」。
-                persistentId =
-                    carlifeInfo.songId.toLongOrNull()
-                        ?: (carlifeInfo.song.trim().hashCode().toLong() and 0xFFFF_FFFFL),
+                // 曲目持久 id：接收端靠它把封面绑到曲目上，缺了就「收到图但挂不上」。
+                persistentId = pid,
+                // 封面 id **必须在这里给出**：链路发送时会重新调用本函数取 np
+                // （VirtualIap2Link.pushNowPlaying → nowPlayingProvider），
+                // 在 pushNowPlayingAll 里 copy 出来的 ftid 会被整个丢弃——
+                // 实测 18:18 每次 0x5001 的「封面ftid=-」就是证据：
+                // 图早传上去了，却从没宣告过，接收端只能等下一个 0x5001 用兜底
+                // 规则碰运气找回，于是 4~20s 才显示。
+                artworkFtid = boundArtworkFtid(pid),
             )
         }
         // 劫持在跑 = 手机音频走 CarLife，此时 MediaSession 只是同一首歌的**更差副本**
