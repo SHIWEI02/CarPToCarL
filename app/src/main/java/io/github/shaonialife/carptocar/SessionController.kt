@@ -330,16 +330,6 @@ object SessionController {
     private const val PROGRESS_PUSH_INTERVAL_MS = 5_000L
 
     /**
-     * 换曲目后的封面静默期。
-     *
-     * 实测（18:11、18:24、18:25、18:32、18:38 共 20 余次切歌）：CarLife 换歌后
-     * **0.5 秒内**到达的 0x10035 帧携带的封面一定是上一首的（有时还夹一张 4363B
-     * 占位图），真图要 0.5~6.6 秒后才来。冷启动时"图→曲目"归属表还是空的，
-     * 只能靠时间隔离，所以这段时间内的图一律不采用。
-     */
-    private const val ARTWORK_SETTLE_MS = 1_200L
-
-    /**
      * 歌名变化：同时补推 WiFi 隧道（currentClient）与蓝牙链路（server/client）。
      *
      * 去重保护：部分播放器（荣耀音乐等）会把「逐行歌词」写进 MediaSession title，
@@ -353,13 +343,6 @@ object SessionController {
         val info = CarLifeHijack.latestCompleteMediaInfo
         val pid = np.persistentId
         val key = "${np.title}|${np.artist}"
-        val now = android.os.SystemClock.elapsedRealtime()
-        // 换曲目时刻（用于封面「静默期」）：CarLife 切歌后 1 秒内塞进来的图一定是旧的，
-        // 而冷启动时「图→曲目」归属表还是空的，只能靠时间隔离。
-        if (pid != null && pid != observedArtworkPid) {
-            observedArtworkPid = pid
-            artworkSettleUntil = now + ARTWORK_SETTLE_MS
-        }
 
         // 封面按「曲目 + ftid」双键绑定：接收端（MacPlay NowPlayingState）用
         // coverKey(id, trackID) 存图，换曲目后同一个 ftid 在新曲目下查不到图，
@@ -368,17 +351,28 @@ object SessionController {
         // CarLife 的封面流很脏，实测（20 余次切歌）固定是：
         //   换歌 0~0.5s：仍带上一首的封面（有时夹一张 4363B 占位图）
         //   0.5~6.6s 后：真图
-        // 且快速连切时会把**更早曲目**的图掺进来。三道闸依次拦：
-        //   ① 静默期 ARTWORK_SETTLE_MS：换曲目后 1.2s 内的图一律不用（冷启动时
-        //      归属表为空，只能靠时间隔离）；
-        //   ② 归属表 artworkOwners：这张图曾被判给别的曲目 → 丢弃；
-        //   ③ 同曲目内只要内容变了就接受（占位图被真图替换往往**更小**，
-        //      早期「只接受更大的图」反而挡住了真图）。
-        // 例外：同一张专辑内不同曲目合法共用同一张图，允许复用。
+        // 且快速连切时会把**更早曲目**的图掺进来。判定用两条，都不用等时间：
+        //   ① 「上一首最后一张图」：切歌瞬间它必然会被再发一遍，精确拦截；
+        //   ② 归属表 artworkOwners：这张图曾判给别的曲目 → 丢弃（拦更早曲目的图）。
+        // 同曲目内只要内容变了就接受（占位图被真图替换往往**更小**，早期
+        // 「只接受更大的图」反而挡住了真图）。同专辑共用一张图时放行。
+        //
+        // 之前用过固定静默期（换歌后 1.2s 内的图一律不用），解决错图但同时把
+        // 真图的到达也推迟了一个推送周期，实测让不少歌要等 5s 以上——换成上面
+        // 的精确判据后不再需要它。
         val raw =
             info?.albumArt?.takeIf {
                 it.isNotEmpty() && !info.partial && pid != null
             }
+        val rawHash = raw?.contentHashCode() ?: 0
+        // 记录「上一个曲目最后一张图」。切歌时 CarLife 会把这张图再发一遍。
+        if (raw != null) {
+            if (pid != lastSeenPid) {
+                prevRawArtHash = lastSeenArtHash
+                lastSeenPid = pid
+            }
+            lastSeenArtHash = rawHash
+        }
         val sameTrack = pid != null && artworkTrackId == pid
         // 该曲目播过：直接用缓存图，不必等 CarLife 慢吞吞地推（实测 0.5~6.6s）。
         val cached = if (pid != null && !sameTrack) artworkCache[pid] else null
@@ -389,28 +383,36 @@ object SessionController {
         // 掺进更早曲目的图（实测 18:32:58 把《我好想你》的 27274B 塞给《Dance Monkey》，
         // 而当时最近一次推送是 4363B 占位图，因此漏判 → 显示中间那首的封面）。
         val owner = artworkOwners[artHash]
-        val carryOver = cached == null && !sameTrack && owner != null && pid != null && owner != pid
+        val carryOver =
+            cached == null && !sameTrack && pid != null &&
+                (
+                    (prevRawArtHash != 0 && rawHash == prevRawArtHash && artworkTrackId != null) ||
+                        (owner != null && owner != pid)
+                )
         // 同一张专辑内不同曲目合法共用同一张图（此时两张图本来就一样，不会显示错）。
         val ownerAlbum = owner?.let { pidAlbums[it] }
         val sameAlbum =
             !sameTrack && art != null &&
                 pid != null && info?.album?.isNotBlank() == true && info?.album == ownerAlbum
-        val settled = now >= artworkSettleUntil
+        // 只要不是旧图，就把它记进归属表——**即使这一轮并不推送**。
+        // 目的：某首歌的真图可能在它当前播放时只是"到过"而没被采用（例如刚好赶上
+        // 缓存/去重），后面切到下一首时才又被 CarLife 补发一次；若当初没记账，
+        // 这张图到了新曲目名下就没有"前科"，会被当成新图收下——正是
+        // 「等封面时切歌，结果冒出上一首等的封面」。
+        if (raw != null && !carryOver && pid != null && artworkOwners[rawHash] == null) {
+            artworkOwners[rawHash] = pid
+        }
         val needUpload =
             when {
                 art == null -> false
                 cached != null -> true // 缓存命中的图必然属于该曲目
-                !sameTrack -> settled && (!carryOver || sameAlbum)
+                !sameTrack -> !carryOver || sameAlbum
                 else -> artHash != artworkHash
             }
-        if (art != null && !needUpload && !sameTrack && lastSkipLoggedPid != pid) {
+        if (art != null && !needUpload && !sameTrack && carryOver && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
             appendLog(
-                if (carryOver) {
-                    "EVENT: 跳过封面 ${art.size}B（该图已归属曲目 $owner，判定为旧图未刷新）"
-                } else {
-                    "EVENT: 跳过封面 ${art.size}B（换曲目静默期内，等真正的图）"
-                },
+                "EVENT: 跳过封面 ${art.size}B（旧图未刷新，归属曲目 ${owner ?: "上一首"}）",
             )
         }
         // 先把「新 ftid 已绑定到本曲目」记下来，再推 0x5001：各条链路发送时会重新
@@ -519,11 +521,14 @@ object SessionController {
     /** 已就「跳过旧封面」打过日志的曲目，避免每个进度周期刷屏。 */
     private var lastSkipLoggedPid: Long? = null
 
-    /** 最近一次观察到的曲目 id（用于判断"刚换曲目"）。 */
-    private var observedArtworkPid: Long? = null
+    /** 最近一次观察到的曲目 id（用于记录「上一个曲目的最后一张图」）。 */
+    private var lastSeenPid: Long? = null
 
-    /** 换曲目后的封面静默期截止时刻：这段时间内的图一定是上一首的。 */
-    private var artworkSettleUntil = 0L
+    /** 上一个曲目最后一张封面图的哈希（切歌时 CarLife 会把它再发一遍）。 */
+    private var lastSeenArtHash = 0
+
+    /** 「上一个曲目的最后一张图」的哈希，用于精确拦截切歌瞬间的旧图。 */
+    private var prevRawArtHash = 0
 
     /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null
@@ -544,8 +549,9 @@ object SessionController {
         artworkHash = 0
         artworkTrackId = null
         artworkAlbum = ""
-        observedArtworkPid = null
-        artworkSettleUntil = 0L
+        lastSeenPid = null
+        lastSeenArtHash = 0
+        prevRawArtHash = 0
         lastSkipLoggedPid = null
     }
 
