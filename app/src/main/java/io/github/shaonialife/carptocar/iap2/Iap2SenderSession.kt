@@ -869,7 +869,11 @@ class Iap2SenderSession(
                 // 传 Iap2NowPlaying.encode() 会双重封包（见该函数注释）。
                 Iap2NowPlaying.body(np),
             )
-            log("iap2 $tag 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"}）")
+            log(
+                "iap2 $tag 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"} " +
+                    "专辑=${np.album ?: "?"} 进度=${np.elapsedMs}/${np.durationMs}ms " +
+                    "状态=${np.status}）",
+            )
         }.onFailure {
             log("iap2 0x5001 发送失败（$tag）- ${it.message}")
         }

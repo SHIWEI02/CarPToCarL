@@ -124,10 +124,29 @@ object CarLifeHijack {
      */
     private var ttsSink: CarLifeAudioSink? = null
 
+    /** 当前是否已接管本机 CarLife 引擎（劫持链路在跑）。 */
+    val isHijacking: Boolean get() = client?.isRunning == true
+
     /** 最近一条 CarLife 媒体信息（0x10035，歌名/歌手/封面）。供 iAP2 0x5001 转发。 */
     @Volatile
     var latestMediaInfo: CarLifeMediaInfo? = null
         private set
+
+    /** 该媒体信息的到达时刻（elapsedRealtime），用于判断它是否还在更新。 */
+    @Volatile
+    private var latestMediaInfoAt = 0L
+
+    /**
+     * 媒体信息是否「新鲜」（默认 10 秒内更新过）。
+     *
+     * 用于决定 0x5001 该采信谁：CarLife 侧字段干净（歌名/歌手/专辑/时长都对），
+     * 但只在「经 CarLife 播放」时有值；不播时会停在上一首。所以要求近 10 秒仍在更新，
+     * 否则回落系统媒体会话（第三方播放器直连场景）。
+     */
+    fun isMediaInfoFresh(maxAgeMs: Long = 10_000L): Boolean {
+        if (latestMediaInfoAt <= 0L) return false
+        return android.os.SystemClock.elapsedRealtime() - latestMediaInfoAt <= maxAgeMs
+    }
 
     /** 媒体信息变化监听（歌名/歌手变化时触发）。 */
     private val mediaInfoListeners = java.util.concurrent.CopyOnWriteArrayList<(CarLifeMediaInfo) -> Unit>()
@@ -1035,6 +1054,7 @@ object CarLifeHijack {
     private fun onMediaInfo(info: CarLifeMediaInfo) {
         // 无论是否重复都要更新缓存：进度/歌词变化时 latestMediaInfo 仍应是最新的。
         latestMediaInfo = info
+        latestMediaInfoAt = android.os.SystemClock.elapsedRealtime()
         val fingerprint = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.size ?: 0}"
         if (fingerprint == lastMediaFingerprint) return
         lastMediaFingerprint = fingerprint
