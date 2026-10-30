@@ -154,17 +154,31 @@ object Iap2NowPlaying {
      * 后其「接收进程异常」直接退出 → 蓝牙桥接被拆 → 车机不停重连（2026-10-25）。
      */
     fun body(np: CarPlayNowPlaying): ByteArray {
+        // 属性号依据 MacPlay 的 iap2-csm（native/livi-helperd/crates/iap2-csm/src/messages/
+        // now_playing.rs，与 WinPlay 同源），不是猜的：
+        //
+        //   MediaItemAttributes: 0 persistent_id(u64) · 1 title · 4 duration_ms(u32)
+        //                        6 album · 12 artist · 14 album_artist · 16 genre
+        //                        26 artwork_ftid(u8)
+        //   PlaybackAttributes:  0 status · 1 elapsed_ms(u32) · 7 app_name
+        //                        12 playback_speed · 13 set_elapsed_available · 16 app_bundle_id
+        //
+        // 两处曾是错的：
+        //  - album 原来发在 0x001A(=26)，那其实是 artwork_ftid(u8)，接收端会把专辑名当封面 id；
+        //  - 从没发过 13 set_elapsed_available，接收端据此判定「不可跳转」→ 进度条整个禁用
+        //    （MacPlay.swift:424 用 canSeek && duration>0 决定是否启用拖动）。
         val mediaItem =
             Iap2Csm.string(0x0001, np.title.orEmpty()) +
                 Iap2Csm.u32(0x0004, np.durationMs.toLong()) +
-                Iap2Csm.string(0x000C, np.artist.orEmpty()) +
-                Iap2Csm.string(0x001A, np.album.orEmpty())
+                Iap2Csm.string(0x0006, np.album.orEmpty()) +
+                Iap2Csm.string(0x000C, np.artist.orEmpty())
         val playback =
             Iap2Csm.u8(0x0000, np.status) +
                 Iap2Csm.u32(0x0001, np.elapsedMs.toLong()) +
-                Iap2Csm.u8(0x0005, np.shuffleMode) +
-                Iap2Csm.u8(0x0006, np.repeatMode) +
-                Iap2Csm.string(0x0007, np.appName.orEmpty())
+                Iap2Csm.string(0x0007, np.appName.orEmpty()) +
+                // 13 set_elapsed_available：非空即视为可跳转（[1] 或空字节都算 true）。
+                // 不发这一条，车机侧进度条就是灰色不可拖的。
+                Iap2Csm.param(0x000D, byteArrayOf(1))
         return Iap2Csm.param(0x0000, mediaItem) + Iap2Csm.param(0x0001, playback)
     }
 }

@@ -712,23 +712,11 @@ class VirtualIap2Link(
                 }
             }
 
-            ids.SET_NOW_PLAYING_INFORMATION -> {
-                // 车机拖动进度条/暂停时下发。不处理的表现是「能拖、松手弹回」。
-                // 本仓此前完全没接这条：收到也不记，等于车机操作被静默丢弃。
-                val cmd = Iap2NowPlaying.parsePlaybackCommand(frame.body)
-                log(
-                    "IAPLINK: 车机 0x5002 SetNowPlaying ${frame.body.size}B hex=" +
-                        frame.body.joinToString(" ") { "%02x".format(it) } +
-                        " → " +
-                        (
-                            cmd?.let { c ->
-                                "status=${c.status ?: "-"} " +
-                                    "elapsed=${c.elapsedMs?.let { it.toString() + "ms" } ?: "-"} " +
-                                    "shuffle=${c.shuffleMode ?: "-"} repeat=${c.repeatMode ?: "-"}"
-                            } ?: "解析不出字段"
-                        ),
-                )
-                if (cmd != null) Iap2NowPlaying.playbackCommandSink?.invoke(cmd)
+            ids.STOP_NOW_PLAYING_UPDATES -> {
+                // 0x5002 是「停止正在播放更新」（空体），依据 MacPlay iap2-csm：
+                // `csm_message! { pub struct StopNowPlayingUpdates = 0x5002 {} }`。
+                // 它不是播放控制——此前按对称结构猜成「设置正在播放」是错的。
+                log("IAPLINK: 车机 0x5002 停止 NowPlaying 更新（${frame.body.size}B）")
             }
 
             else -> {

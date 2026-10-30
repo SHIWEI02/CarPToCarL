@@ -62,10 +62,12 @@ object Iap2MessageIds {
     const val NOW_PLAYING_UPDATE = 0x5001
 
     /**
-     * 车机 → 手机：设置正在播放（播放/暂停）。号码未见于 Apple 公开表，
-     * 但车机发送清单里同时声明了 0x5002/0x5003；按 WinPlay 源码，**0x5003 才是拖动进度**。
+     * 车机 → 手机：**停止**正在播放更新（空体）。
+     *
+     * 依据 MacPlay 的 iap2-csm：`csm_message! { pub struct StopNowPlayingUpdates = 0x5002 {} }`。
+     * 此前按「0x5001 playback 组对称」猜成「设置正在播放」，是错的——0x5002 不是播放控制。
      */
-    const val SET_NOW_PLAYING_INFORMATION = 0x5002
+    const val STOP_NOW_PLAYING_UPDATES = 0x5002
 
     /**
      * 车机 → 手机：**跳转播放位置**（拖动进度条）。
@@ -111,7 +113,7 @@ object Iap2MessageIds {
             EA_CLOSE_SESSION -> "StopEASession"
             EA_SESSION_STATUS -> "EASessionStatus"
             START_NOW_PLAYING_UPDATES -> "StartNowPlayingUpdates"
-            SET_NOW_PLAYING_INFORMATION -> "SetNowPlayingInformation"
+            STOP_NOW_PLAYING_UPDATES -> "StopNowPlayingUpdates"
             SEEK_POSITION -> "SeekPosition"
             NOW_PLAYING_UPDATE -> "NowPlayingUpdate"
             START_ROUTE_GUIDANCE_UPDATES -> "StartRouteGuidanceUpdates"
