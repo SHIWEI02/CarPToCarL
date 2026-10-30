@@ -104,6 +104,8 @@ class Iap2LinkEngine(
         var retransmissions: Int = 0,
         var deadlineMillis: Long = 0,
         val awaitAck: Boolean = true,
+        /** 0 = 走控制会话（[controlSessionId]）；非 0 = 指定会话（如 file-transfer 12）。 */
+        val sessionId: Int = 0,
     )
 
     var state: State = State.IDLE
@@ -350,6 +352,29 @@ class Iap2LinkEngine(
         return true
     }
 
+    /**
+     * 在 **file-transfer 会话（12）** 上发一个数据报（封面）。
+     *
+     * 发后不管：我们的 iAP2 链路跑在 TCP 控制通道上，不存在空口丢包；而重传追踪一旦
+     * 遇到「接收端不 ACK 这类数据帧」就会按重传看门狗把整条链路判死（0x4E0E 的教训）。
+     *
+     * 数据报格式（接收端 [MacPlay] `livi-runtime/src/file_transfer.rs` 的做法）：
+     *   `[ftid][control][payload…]`
+     *   control: 0x04 SETUP / 0x01 START / 0x80 首片 / 0xC0 首片且唯一 / 0x00 中间 / 0x40 末片
+     */
+    fun sendFileTransfer(
+        bytes: ByteArray,
+        nowMillis: Long,
+    ): Boolean {
+        if (state == State.DEAD) return false
+        val limit = (peerSynchronization?.maxLength ?: 0xFFFF) - HEADER_BYTES - 1
+        if (limit <= 0 || bytes.size > limit) return false
+        sendBacklog +=
+            Packet(0, bytes.copyOf(), awaitAck = false, sessionId = SESSION_FILE_TRANSFER)
+        drainSendWindow(nowMillis)
+        return true
+    }
+
     // ---- 接收解析 ----
 
     private fun parseAvailable(nowMillis: Long): Boolean {
@@ -592,7 +617,12 @@ class Iap2LinkEngine(
             return
         }
         target.deadlineMillis = nowMillis + retransmissionDelayMillis()
-        writePacket(target.payload, target.sequence, CONTROL_ACKNOWLEDGEMENT, controlSessionId())
+        writePacket(
+            target.payload,
+            target.sequence,
+            CONTROL_ACKNOWLEDGEMENT,
+            if (target.sessionId != 0) target.sessionId else controlSessionId(),
+        )
         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
     }
 
@@ -646,7 +676,12 @@ class Iap2LinkEngine(
             sentSequence = nextSequence(sentSequence)
             packet.sequence = sentSequence
             packet.deadlineMillis = nowMillis + retransmissionDelayMillis()
-            writePacket(packet.payload, packet.sequence, CONTROL_ACKNOWLEDGEMENT, controlSessionId())
+            writePacket(
+                packet.payload,
+                packet.sequence,
+                CONTROL_ACKNOWLEDGEMENT,
+                if (packet.sessionId != 0) packet.sessionId else controlSessionId(),
+            )
             if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
             if (peer == null || peer.maxRetransmissions > 0) {
                 unacknowledged += packet
@@ -668,7 +703,12 @@ class Iap2LinkEngine(
             die("packet ${next.sequence} not acknowledged")
             return
         }
-        writePacket(next.payload, next.sequence, CONTROL_ACKNOWLEDGEMENT, controlSessionId())
+        writePacket(
+            next.payload,
+            next.sequence,
+            CONTROL_ACKNOWLEDGEMENT,
+            if (next.sessionId != 0) next.sessionId else controlSessionId(),
+        )
         retransmitDeadline = unacknowledged.minOfOrNull { it.deadlineMillis }
     }
 

@@ -26,6 +26,14 @@ data class CarPlayNowPlaying(
     val shuffleMode: Int = 0,
     val repeatMode: Int = 0,
     val appName: String?,
+    /**
+     * 封面在 iAP2 file-transfer 会话上的文件 id（媒体项属性 26 `artwork_ftid`，u8）。
+     *
+     * 封面**不内联**在 0x5001 里：这里只发一个 id，接收端据此知道「有新封面可拿」，
+     * 真正的 JPEG 由手机在 file-transfer 会话（session 12）上推送。
+     * null = 本曲没有封面可发。
+     */
+    val artworkFtid: Int? = null,
 )
 
 object Iap2NowPlaying {
@@ -180,7 +188,9 @@ object Iap2NowPlaying {
             Iap2Csm.string(0x0001, np.title.orEmpty()) +
                 Iap2Csm.u32(0x0004, np.durationMs.toLong()) +
                 Iap2Csm.string(0x0006, np.album.orEmpty()) +
-                Iap2Csm.string(0x000C, np.artist.orEmpty())
+                Iap2Csm.string(0x000C, np.artist.orEmpty()) +
+                // 26 = artwork_ftid(u8)：只发 id，JPEG 走 file-transfer 会话（见 pushArtwork）。
+                (np.artworkFtid?.let { Iap2Csm.u8(0x001A, it and 0xFF) } ?: ByteArray(0))
         val playback =
             Iap2Csm.u8(0x0000, np.status) +
                 Iap2Csm.u32(0x0001, np.elapsedMs.toLong()) +

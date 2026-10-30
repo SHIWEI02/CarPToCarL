@@ -483,6 +483,46 @@ class VirtualIap2Link(
         SessionTrace.csm(SessionTrace.Dir.TX, "tunnel", messageId, body, if (ok) "" else "send-failed")
     }
 
+    /**
+     * 推送专辑封面到 **file-transfer 会话（12）**。
+     *
+     * 封面不内联在 0x5001 里：只需在 0x5001 的媒体项属性 26 发一个 `artwork_ftid`，
+     * 再把 JPEG 按 `[ftid][ctrl][分片]` 推过去，接收端按 ftid 重组。
+     * ctrl 取值对齐接收端实现（MacPlay `livi-runtime/src/file_transfer.rs`）：
+     * 单帧 0xC0；多帧 0x80 → 0x00… → 0x40。
+     *
+     * @return 是否全部推出。
+     */
+    fun pushArtwork(
+        ftid: Int,
+        jpeg: ByteArray,
+    ): Boolean {
+        if (jpeg.isEmpty()) return false
+        synchronized(lock) {
+            val chunkSize = 900
+            val chunks = (jpeg.size + chunkSize - 1) / chunkSize
+            var sent = 0
+            for (index in 0 until chunks) {
+                val from = index * chunkSize
+                val to = minOf(from + chunkSize, jpeg.size)
+                val control =
+                    when {
+                        chunks == 1 -> 0xC0
+                        index == 0 -> 0x80
+                        index == chunks - 1 -> 0x40
+                        else -> 0x00
+                    }
+                val datagram = ByteArray(2 + (to - from))
+                datagram[0] = (ftid and 0xFF).toByte()
+                datagram[1] = control.toByte()
+                jpeg.copyInto(datagram, 2, from, to)
+                if (engine.sendFileTransfer(datagram, System.nanoTime() / 1_000_000L)) sent++
+            }
+            log("IAPLINK: 推送封面 ftid=$ftid ${jpeg.size}B（$chunks 片，成功 $sent）")
+            return sent == chunks
+        }
+    }
+
     /** 直接投递完整 CSM 帧（Frida 抓的逐字节常量，勿重新编码）。 */
     private fun sendRawCsmLocked(frame: ByteArray) {
         val ok = engine.sendControl(frame, System.nanoTime() / 1_000_000L)

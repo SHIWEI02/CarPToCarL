@@ -338,14 +338,36 @@ object SessionController {
      * @param force 进度条刷新用：跳过 title|artist 去重，但仍更新去重键。
      */
     private fun pushNowPlayingAll(force: Boolean = false) {
-        val np = buildNowPlaying() ?: return
+        var np = buildNowPlaying() ?: return
+        // 封面：内容变了才换 ftid（否则每次 5s 进度补推都重发 20KB）。
+        // 0x5001 里只带 ftid，JPEG 走 file-transfer 会话，两者必须成对更新。
+        val art = CarLifeHijack.latestMediaInfo?.albumArt?.takeIf { it.isNotEmpty() }
+        val artChanged = art != null && art.contentHashCode() != lastArtworkHash
+        if (artChanged) {
+            lastArtworkHash = art!!.contentHashCode()
+            artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
+        }
+        if (art != null) np = np.copy(artworkFtid = artworkFtid)
         val key = "${np.title}|${np.artist}"
-        if (!force && key == lastPushedNowPlayingKey) return
+        if (!force && !artChanged && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
         currentClient?.pushNowPlaying()
         bluetoothServer?.pushNowPlaying()
         bluetoothClient?.pushNowPlaying()
+        if (artChanged && art != null) {
+            val ok = currentClient?.pushArtwork(artworkFtid, art) ?: false
+            appendLog(
+                "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B → " +
+                    (if (ok) "已发出" else "无隧道链路/失败"),
+            )
+        }
     }
+
+    /** 当前封面在 file-transfer 会话上的文件 id（0 = 还没发过）。 */
+    private var artworkFtid = 0
+
+    /** 上次推送的封面内容哈希，用来判断「换图了」。 */
+    private var lastArtworkHash = 0
 
     /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null

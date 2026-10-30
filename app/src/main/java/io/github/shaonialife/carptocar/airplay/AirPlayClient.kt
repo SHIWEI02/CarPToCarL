@@ -1415,6 +1415,15 @@ class AirPlayClient(
     }
 
     /**
+     * 推送专辑封面（iAP2 file-transfer 会话）。需先让 0x5001 带上同一个 `artwork_ftid`。
+     * 返回 false = 没有隧道链路（蓝牙链路暂未实现封面推送）。
+     */
+    fun pushArtwork(
+        ftid: Int,
+        jpeg: ByteArray,
+    ): Boolean = runCatching { obtainIapLink().pushArtwork(ftid, jpeg) }.getOrDefault(false)
+
+    /**
      * MIB3 布防：屏幕流 SETUP 成功后调用——主动经**控制通道** POST /command 发一次
      * DETECT，随后等车机 SYN（真机 Frida 时序，详见 [VirtualIap2Link.armMib3]）。
      * 明文会话（pre-HomeKit 老车机）没有 WiFi 隧道语义，跳过。
