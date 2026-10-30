@@ -134,7 +134,7 @@ class CarLifeHuClient(
     private var versionMatched = false
 
     /**
-     * 视频通道（9242）是否已失效。
+     * 视频通道（8240）是否已失效。
      *
      * 实测（2026-10-24 12:38:48）CarLife 引擎冷启动时 7 个端口**全部 accept**，但
      * 视频/媒体/TTS 三条会在 accept 后立刻被引擎 reset——TCP 连接是通的，socket
@@ -143,6 +143,61 @@ class CarLifeHuClient(
      */
     @Volatile
     private var videoDead = false
+
+    /**
+     * 媒体音频通道（9240）是否已失效。
+     *
+     * 与 [videoDead] 同一类问题：引擎冷启动会把这三条通道一起 reset。视频有看门狗
+     * 能复活，音频一旦死掉就永久静音——实测 2026-10-30 15:42:37
+     * 「视频/媒体/TTS 同时 Connection reset，只有视频重连成功」，
+     * 表现就是**画面正常、完全没有声音**，且具有偶发性。
+     */
+    @Volatile
+    private var mediaDead = false
+
+    /** TTS/导航播报音频通道（9241）是否已失效。见 [mediaDead]。 */
+    @Volatile
+    private var ttsDead = false
+
+    /** 媒体音频通道本轮建连时刻（uptimeMillis），用于「连着但引擎不推流」诊断。 */
+    @Volatile
+    private var mediaChannelSince = 0L
+
+    /** TTS 音频通道本轮建连时刻（uptimeMillis）。 */
+    @Volatile
+    private var ttsChannelSince = 0L
+
+    /** 本轮建连时的媒体包计数基线——「建连以来是否收到过包」要用差值判断。 */
+    @Volatile
+    private var mediaPacketBaseline = 0L
+
+    /** 本轮建连时的 TTS 包计数基线。 */
+    @Volatile
+    private var ttsPacketBaseline = 0L
+
+    /**
+     * 最近一次收到 CarLife **媒体进度**的时刻。
+     *
+     * 引擎在播放时每秒推一条进度，是「此刻确实有声音在放」的唯一可信信号。
+     * 音频通道没有类似的保活应答，只能借它做判据。
+     */
+    @Volatile
+    private var lastMediaProgressAt = 0L
+
+    /** 最近一次收到媒体音频 PCM 的时刻。 */
+    @Volatile
+    private var lastMediaAudioAt = 0L
+
+    /** 「正在播放却收不到音频」强制重建音频通道的次数（退避用）。 */
+    @Volatile
+    private var audioKickCount = 0
+
+    /** 已收到的 TTS/导航播报音频包数（诊断用；媒体侧用 [audioPacketCount]）。 */
+    @Volatile
+    private var ttsPacketCount: Long = 0
+
+    /** 本轮建连内已经提示过「通道活着但无音频」的通道集合，避免刷屏。 */
+    private val silentWarned = HashSet<String>()
 
     /** 最近一次收到视频帧的时刻（elapsedRealtime）。 */
     @Volatile
@@ -253,6 +308,14 @@ class CarLifeHuClient(
         touchOut = sockets[CarLifeProtocol.PORT_TOUCH]?.getOutputStream()
         running.set(true)
         lastFrameAt = android.os.SystemClock.uptimeMillis()
+        // 上一轮遗留的失效标记必须清掉，否则新会话第一条音频还没读就被判死。
+        videoDead = false
+        mediaDead = false
+        ttsDead = false
+        audioKickCount = 0
+        lastMediaAudioAt = 0L
+        lastMediaProgressAt = 0L
+        silentWarned.clear()
         if (touchOut != null) startTouchWorker()
 
         startReader("carlife-cmd") { cmdReader(cmd.getInputStream()) }
@@ -260,11 +323,15 @@ class CarLifeHuClient(
             startReader("carlife-video") { videoReader(video.getInputStream()) }
         }
         sockets[CarLifeProtocol.PORT_MEDIA]?.let { media ->
+            mediaChannelSince = android.os.SystemClock.uptimeMillis()
+            mediaPacketBaseline = audioPacketCount
             startReader("carlife-media") {
                 audioReader(media.getInputStream(), "媒体")
             }
         }
         sockets[CarLifeProtocol.PORT_TTS]?.let { tts ->
+            ttsChannelSince = android.os.SystemClock.uptimeMillis()
+            ttsPacketBaseline = ttsPacketCount
             startReader("carlife-tts") {
                 audioReader(tts.getInputStream(), "TTS", isTts = true)
             }
@@ -272,6 +339,8 @@ class CarLifeHuClient(
         startReader("carlife-heartbeat") { heartbeatLoop() }
         // 视频通道看门狗：冷启动期被引擎 reset、或中途断链时自动重连并重发编码初始化。
         startReader("carlife-video-dog") { videoSupervisor() }
+        // 音频看门狗：媒体(9240)/TTS(9241) 同样会被引擎 reset，没有它就会永久静音。
+        startReader("carlife-audio-dog") { audioSupervisor() }
 
         return sendVersionNegotiation()
     }
@@ -571,6 +640,7 @@ class CarLifeHuClient(
                     0
                 }
                 log("CARLIFE: 媒体进度 ${progress}ms")
+                lastMediaProgressAt = android.os.SystemClock.uptimeMillis()
             }
 
             in CarLifeProtocol.MD_IGNORED_IDS -> {
@@ -759,6 +829,153 @@ class CarLifeHuClient(
     }
 
     /**
+     * 音频通道看门狗（媒体 9240 / TTS 9241）。
+     *
+     * 与 [videoSupervisor] 同源问题：CarLife 引擎冷启动会把视频/媒体/TTS 三条通道
+     * 一起 `Connection reset`。视频有看门狗能复活，音频此前没有——于是「画面正常、
+     * 一点声音都没有」，且只在引擎恰好 reset 音频端口时出现，表现为偶发。
+     *
+     * 音频链路**没有**类似 98311 的「请引擎重启编码器」指令（音频是引擎按播放状态
+     * 主动推的裸 PCM），所以这里只做两件事：
+     *  1. socket 死了 → 重连该端口并挂上新读线程；
+     *  2. 重连成功但长时间没有音频包 → 打一条诊断，区分「引擎不推」与「通道死了」。
+     *
+     * 顺带修掉 `start()` 的缺陷：连接失败只记一行日志、永不重试。这里 socket 为
+     * null 同样会重连，所以引擎晚于我们监听端口也能自愈。
+     */
+    private fun audioSupervisor() {
+        var reconnects = 0
+        while (running.get()) {
+            Thread.sleep(1_000)
+            if (!running.get()) return
+            var reopened = false
+            if (isChannelDead(CarLifeProtocol.PORT_MEDIA, mediaDead)) {
+                if (reopenAudio(CarLifeProtocol.PORT_MEDIA, "媒体")) {
+                    reconnects++
+                    reopened = true
+                }
+            }
+            if (isChannelDead(CarLifeProtocol.PORT_TTS, ttsDead)) {
+                if (reopenAudio(CarLifeProtocol.PORT_TTS, "TTS")) {
+                    reconnects++
+                    reopened = true
+                }
+            }
+            if (reopened && reconnects > 3) {
+                // 连上又立刻被 reset 时放慢节奏，别把引擎打满。
+                Thread.sleep(2_000)
+            }
+            warnIfSilent()
+            kickStaleMediaAudio()
+        }
+    }
+
+    /**
+     * 「引擎在播放，但音频通道收不到 PCM」→ 强制重建媒体音频通道。
+     *
+     * 这是实测 2026-10-30 16:07 暴露的第二种失效形态：socket 活着（TCP 没断、
+     * 读线程没退出），但引擎把音频投给了已失效的旧客户端，于是永远静音——
+     * 单靠「socket 是否断开」判断不出来。
+     *
+     * 判据用引擎自己的 `MD_MEDIA_PROGRESS`（播放中每秒一条）：进度在走就说明
+     * 此刻确实有声音在放，若同时 [MEDIA_STALE_BASE_MS] 内一个音频包都没有，
+     * 只能是通道逻辑失效。重建次数按 [audioKickCount] 线性退避，收到包即清零，
+     * 避免在「引擎确实不推音频」的场景下变成无限重连。
+     */
+    private fun kickStaleMediaAudio() {
+        val now = android.os.SystemClock.uptimeMillis()
+        val playing = lastMediaProgressAt > 0 && now - lastMediaProgressAt < MEDIA_PLAYING_WINDOW_MS
+        if (!playing) return
+        val socket = sockets[CarLifeProtocol.PORT_MEDIA] ?: return
+        if (socket.isClosed) return
+        val silentSince = maxOf(mediaChannelSince, lastMediaAudioAt)
+        if (silentSince <= 0) return
+        val threshold = (MEDIA_STALE_BASE_MS * (audioKickCount + 1))
+            .coerceAtMost(MEDIA_STALE_MAX_MS)
+        if (now - silentSince < threshold) return
+        audioKickCount++
+        log(
+            "CARLIFE: 媒体正在播放（进度持续更新）但 ${(now - silentSince) / 1000}s 无音频包" +
+                "——判定音频通道逻辑失效，重建（第 $audioKickCount 次）",
+        )
+        runCatching { sockets.remove(CarLifeProtocol.PORT_MEDIA)?.close() }
+        mediaDead = true
+    }
+
+    /** 通道是否不可用：socket 不存在 / 已关闭 / 读线程已判定死亡。 */
+    private fun isChannelDead(port: Int, dead: Boolean): Boolean {
+        val socket = sockets[port]
+        return socket == null || socket.isClosed || dead
+    }
+
+    /** 重连音频端口并挂上新的读线程。成功返回 true。 */
+    private fun reopenAudio(port: Int, label: String): Boolean {
+        runCatching { sockets.remove(port)?.close() }
+        val socket = Socket()
+        return try {
+            socket.tcpNoDelay = true
+            socket.connect(InetSocketAddress(host, port), connectTimeoutMs)
+            if (!running.get()) {
+                runCatching { socket.close() }
+                return false
+            }
+            sockets[port] = socket
+            val isTts = port == CarLifeProtocol.PORT_TTS
+            val now = android.os.SystemClock.uptimeMillis()
+            synchronized(silentWarned) { silentWarned.remove(label) }
+            if (isTts) {
+                ttsDead = false
+                ttsChannelSince = now
+                ttsPacketBaseline = ttsPacketCount
+            } else {
+                mediaDead = false
+                mediaChannelSince = now
+                mediaPacketBaseline = audioPacketCount
+            }
+            startReader(if (isTts) "carlife-tts" else "carlife-media") {
+                audioReader(socket.getInputStream(), label, isTts = isTts)
+            }
+            log("CARLIFE: $label 音频通道已重连（端口 $port，等待引擎推流）")
+            true
+        } catch (error: Exception) {
+            runCatching { socket.close() }
+            false
+        }
+    }
+
+    /**
+     * 「通道活着但一直没音频」诊断。
+     *
+     * 只在**本轮建连之后一包都没收到**时提示一次：媒体在没播放时天然无包，
+     * 所以不能按「多久没包」判断，只能看「建连以来是否有过包」。
+     */
+    private fun warnIfSilent() {
+        val now = android.os.SystemClock.uptimeMillis()
+        val mediaSocket = sockets[CarLifeProtocol.PORT_MEDIA]
+        val ttsSocket = sockets[CarLifeProtocol.PORT_TTS]
+        if (mediaSocket != null && !mediaSocket.isClosed && audioPacketCount == mediaPacketBaseline) {
+            if (mediaChannelSince > 0 && now - mediaChannelSince > SILENT_WARN_MS &&
+                synchronized(silentWarned) { silentWarned.add("媒体") }
+            ) {
+                log(
+                    "CARLIFE: 媒体 音频通道已连接 ${(now - mediaChannelSince) / 1000}s 但无任何音频包" +
+                        "——引擎未推流（或本次会话无媒体播放），通道本身存活",
+                )
+            }
+        }
+        if (ttsSocket != null && !ttsSocket.isClosed && ttsPacketCount == ttsPacketBaseline) {
+            if (ttsChannelSince > 0 && now - ttsChannelSince > SILENT_WARN_MS &&
+                synchronized(silentWarned) { silentWarned.add("TTS") }
+            ) {
+                log(
+                    "CARLIFE: TTS 音频通道已连接 ${(now - ttsChannelSince) / 1000}s 但无播报音频" +
+                        "——通道存活，等导航播报触发",
+                )
+            }
+        }
+    }
+
+    /**
      * 请求引擎重建编码器（重发 98386 + 98311）。
      *
      * 重建后引擎必然补一个「SPS + PPS + IDR」，车机侧就能拿到 VideoConfig 配置解码器。
@@ -941,6 +1158,7 @@ class CarLifeHuClient(
                             onTtsFormat(ttsRate, ttsChannels)
                         }
                         ttsPackets++
+                        ttsPacketCount++
                         if (ttsPackets == 1L) {
                             log("CARLIFE: ✓ 收到导航播报音频（TTS 首包 ${length}B，${ttsRate}Hz ${ttsChannels}ch）")
                         }
@@ -973,7 +1191,11 @@ class CarLifeHuClient(
                             log("CARLIFE: $label 未收到格式宣告，按 48kHz 立体声处理")
                             onAudioFormat(DEFAULT_AUDIO_RATE, 2)
                         }
-                        if (length > 0) onAudioPcm(payload, length)
+                        if (length > 0) {
+                            lastMediaAudioAt = android.os.SystemClock.uptimeMillis()
+                            audioKickCount = 0
+                            onAudioPcm(payload, length)
+                        }
                     }
 
                     // 引擎音频开停信号（长度 0）：来电/路由切换时引擎会先发 STOP，
@@ -997,6 +1219,10 @@ class CarLifeHuClient(
             }
         } catch (error: Exception) {
             if (running.get()) log("CARLIFE: $label 音频通道断开 - ${error.message}")
+        } finally {
+            // 无论 EOF、reset 还是长度异常提前 return，这条 socket 都已不可用，
+            // 必须交给 audioSupervisor 重连——否则视频有声、音频永久静音。
+            if (isTts) ttsDead = true else mediaDead = true
         }
     }
 
@@ -1160,6 +1386,23 @@ class CarLifeHuClient(
          * socket 存活时只重发 98311、次数不设上限——只有 socket 真的死了才走重连。
          */
         private const val MAX_REINIT_INTERVAL_MS = 60_000L
+
+        /**
+         * 音频通道建连后多久**完全没有包**就打一条诊断。
+         *
+         * 音频是引擎按播放状态主动推的，没播放时天然无包，所以只能看「建连以来是否
+         * 有过包」，不能按「最近多久没包」判断，否则停车静音时会误报。
+         */
+        private const val SILENT_WARN_MS = 20_000L
+
+        /** 媒体进度多久内算「正在播放」。引擎播放时每秒推一条，留 5s 容错。 */
+        private const val MEDIA_PLAYING_WINDOW_MS = 5_000L
+
+        /** 「正在播放却无音频包」首次判死的等待时长。 */
+        private const val MEDIA_STALE_BASE_MS = 10_000L
+
+        /** 反复重建时的最大等待间隔（10s → 20s → 30s 封顶；收到音频包即清零）。 */
+        private const val MEDIA_STALE_MAX_MS = 30_000L
 
         private val PORTS = intArrayOf(
             CarLifeProtocol.PORT_CMD,
