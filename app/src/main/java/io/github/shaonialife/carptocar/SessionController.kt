@@ -330,6 +330,15 @@ object SessionController {
     private const val PROGRESS_PUSH_INTERVAL_MS = 5_000L
 
     /**
+     * 可进缓存的封面最小字节数。
+     *
+     * 本机 CarLife 的占位图是 4363B（偶尔 2817B），真封面实测都在 17~30KB。
+     * 占位图照常推给车机（总比空白好），但不缓存——否则切回这首歌会立刻显示
+     * 那张占位图，而不是等真图。
+     */
+    private const val ARTWORK_CACHE_MIN_BYTES = 8_000
+
+    /**
      * 歌名变化：同时补推 WiFi 隧道（currentClient）与蓝牙链路（server/client）。
      *
      * 去重保护：部分播放器（荣耀音乐等）会把「逐行歌词」写进 MediaSession title，
@@ -437,7 +446,10 @@ object SessionController {
                 artworkTrackId = null
                 artworkHash = 0
             } else if (pid != null) {
-                artworkCache[pid] = art
+                // 只缓存「真图」。CarLife 有个 4363B（偶尔 2817B）的占位图，会在
+                // 切歌瞬间或它还没取到封面时冒出来；若把它存进缓存，下次切回这首歌
+                // 就会立刻显示那张占位图（实测 18:44:06「缓存 4363B」）。
+                if (art.size >= ARTWORK_CACHE_MIN_BYTES) artworkCache[pid] = art
                 artworkOwners[artHash] = pid
                 val album = info?.album.orEmpty()
                 if (album.isNotBlank()) pidAlbums[pid] = album
