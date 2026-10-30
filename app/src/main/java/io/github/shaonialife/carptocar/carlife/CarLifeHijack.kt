@@ -1055,7 +1055,9 @@ object CarLifeHijack {
         // 无论是否重复都要更新缓存：进度/歌词变化时 latestMediaInfo 仍应是最新的。
         latestMediaInfo = info
         latestMediaInfoAt = android.os.SystemClock.elapsedRealtime()
-        val fingerprint = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.size ?: 0}"
+        // 指纹用封面**内容哈希**而不是字节数：CarLife 重新编码同一张图时字节数可能不变
+        // 而内容不同，比字节数会漏掉这次变化，导致要等 5s 的进度补推才更新封面。
+        val fingerprint = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.contentHashCode() ?: 0}"
         if (fingerprint == lastMediaFingerprint) return
         lastMediaFingerprint = fingerprint
         mediaInfoListeners.forEach { runCatching { it(info) } }

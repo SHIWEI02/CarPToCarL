@@ -350,31 +350,43 @@ object SessionController {
         if (info?.partial == true && pid != null && lastPushedNowPlayingKey != null) return
 
         // 封面按「曲目 + ftid」双键绑定：接收端（MacPlay NowPlayingState）用
-        // coverKey(id, trackID) 存图，换曲目后同一个 ftid 在新曲目下查不到图。
-        // 所以换曲目时一律换新 ftid，即使图片字节相同也要重发一次。
+        // coverKey(id, trackID) 存图，换曲目后同一个 ftid 在新曲目下查不到图，
+        // 所以换曲目时一律换新 ftid。
         //
-        // 但**不能见到图就发**：实测 18:11:18 切歌时，CarLife 先推两条仍带**上一首封面**
-        // 的帧（25675B，《因为爱情》），0.5s 后才推真正的 27274B。照单全收就会把旧封面
-        // 挂到新曲目上——「切歌后封面还是之前的」。
+        // 实测规律（2026-10-30 18:21~18:26，13 次切歌无一例外）：CarLife 切歌后
+        // 前 1~2 帧携带的**仍是上一首的封面**，随后可能夹一张 4363B 占位图，
+        // 最后才是真图：
+        //   18:25:21.524 成全 art= 4363（占位）
+        //   18:25:21.538 成全 art=26463（上一首《再见太难》的图）
+        //   18:25:23.668 成全 art=25279（真图）
+        // 早期判据「同曲目只接受更大的图」会被第二步钻空：26463 > 4363，于是把
+        // 上一首的封面当成新曲目封面推出去——这就是「切歌后封面还是上一个」。
         //
-        // 判据：换曲目后，图片必须与上一首**不同**才发；字节相同则视为「尚未刷新」。
-        // 例外：同一张专辑内不同曲目合法共用一张图，此时允许复用（换新 ftid 重发）。
-        val art =
+        // 现在按**上一首已绑定的封面哈希**判定：换曲目后凡是出现这个哈希的图一律
+        // 视为「未刷新的旧图」丢弃，与大小无关；同曲目内则接受任何新图（占位图
+        // 被真图替换时通常**更小**，旧的大小规则反而挡住了它）。
+        // 例外：同一张专辑内不同曲目合法共用同一张图，允许复用。
+        val raw =
             info?.albumArt?.takeIf {
                 it.isNotEmpty() && !info.partial && pid != null
             }
-        val hashDiffers = art != null && art.contentHashCode() != lastArtworkHash
         val sameTrack = pid != null && artworkTrackId == pid
+        // 该曲目播过：直接用缓存图，不必等 CarLife 慢吞吞地推（实测 0.5~6.6s）。
+        val cached = if (pid != null && !sameTrack) artworkCache[pid] else null
+        val art = cached ?: raw
+        val artHash = art?.contentHashCode() ?: 0
+        // 「沿用上一首的图」= 与最近一次成功发出的图字节完全相同，且不是本曲目。
+        val carryOver = cached == null && !sameTrack && artworkTrackId != null && artHash == artworkHash
         val sameAlbum =
             !sameTrack && art != null &&
-                !info?.album.isNullOrBlank() && info?.album == lastArtworkAlbum
+                !info?.album.isNullOrBlank() && info?.album == artworkAlbum
         val needUpload =
             when {
                 art == null -> false
-                sameTrack -> hashDiffers && art.size > lastArtworkSize // 同曲目：只接受更大的
-                else -> hashDiffers || sameAlbum // 换曲目：新图，或同专辑合法共用
+                !sameTrack -> !carryOver || sameAlbum
+                else -> artHash != artworkHash
             }
-        if (art != null && !needUpload && !sameTrack && !hashDiffers && lastSkipLoggedPid != pid) {
+        if (art != null && !needUpload && carryOver && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
             appendLog("EVENT: 跳过封面 ${art.size}B（与上一首完全相同，判定为未刷新的旧图）")
         }
@@ -384,9 +396,8 @@ object SessionController {
         if (needUpload) {
             artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
             artworkTrackId = pid
-            lastArtworkHash = art!!.contentHashCode()
-            lastArtworkSize = art.size
-            lastArtworkAlbum = info?.album.orEmpty()
+            artworkHash = artHash
+            artworkAlbum = info?.album.orEmpty()
         }
         if (!force && !needUpload && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
@@ -399,11 +410,13 @@ object SessionController {
             // 回滚后下一轮会分配新 ftid 重试。
             if (!ok) {
                 artworkTrackId = null
-                lastArtworkHash = 0
-                lastArtworkSize = 0
+                artworkHash = 0
+            } else if (pid != null) {
+                artworkCache[pid] = art
             }
             appendLog(
-                "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid → " +
+                "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid" +
+                    (if (cached != null) "（缓存）" else "") + " → " +
                     (if (ok) "已发出" else "无隧道链路/失败（下次补推）"),
             )
         }
@@ -439,17 +452,25 @@ object SessionController {
     /** 当前封面在 file-transfer 会话上的文件 id（0 = 还没发过）。 */
     private var artworkFtid = 0
 
-    /** 上次**成功发出**的封面内容哈希，用来判断「换图了」。 */
-    private var lastArtworkHash = 0
-
-    /** 上次成功发出封面的字节数（同一首歌内只接受更大的图）。 */
-    private var lastArtworkSize = 0
+    /** 最近一次成功发出的封面内容哈希（配合 [artworkTrackId] 判定「是不是旧图」）。 */
+    private var artworkHash = 0
 
     /** 上次成功发出封面所属的**曲目持久 id**（不是歌名——过渡帧的歌名不可靠）。 */
     private var artworkTrackId: Long? = null
 
-    /** 上次成功发出封面所属的专辑名（同专辑内允许复用同一张图）。 */
-    private var lastArtworkAlbum: String = ""
+    /** 最近一次成功发出封面所属的专辑名（同专辑内允许复用同一张图）。 */
+    private var artworkAlbum: String = ""
+
+    /**
+     * 曲目 → 封面缓存（最近 16 首，LRU）。
+     *
+     * CarLife 切歌后要 0.5~6.6s 才推来真图，期间还会先塞上一首的图；缓存命中时
+     * 直接用上一次听这首歌时的封面，切歌即出图，不必干等。
+     */
+    private val artworkCache =
+        object : LinkedHashMap<Long, ByteArray>(16, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, ByteArray>?) = size > 16
+        }
 
     /** 已就「跳过旧封面」打过日志的曲目，避免每个进度周期刷屏。 */
     private var lastSkipLoggedPid: Long? = null
@@ -470,10 +491,9 @@ object SessionController {
         // 封面同理：接收端重连后是新会话，之前传过的文件不算数。
         // 不清这两个键会导致「重连后同一首歌封面一直空白」——artChanged 恒为 false
         // 所以不再补传，但 0x5001 仍在宣告 artwork_ftid，接收端有 id 无文件。
-        lastArtworkHash = 0
-        lastArtworkSize = 0
+        artworkHash = 0
         artworkTrackId = null
-        lastArtworkAlbum = ""
+        artworkAlbum = ""
         lastSkipLoggedPid = null
     }
 
