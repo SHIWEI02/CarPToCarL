@@ -339,6 +339,9 @@ object SessionController {
      */
     private const val ARTWORK_MIN_BYTES = 8_000
 
+    /** 封面归属的有效期：超过这个时间就不再据它拒绝别的曲目（防误判固化）。 */
+    private const val ARTWORK_OWNER_TTL_MS = 30_000L
+
     /**
      * 歌名变化：同时补推 WiFi 隧道（currentClient）与蓝牙链路（server/client）。
      *
@@ -353,6 +356,7 @@ object SessionController {
         val info = CarLifeHijack.latestCompleteMediaInfo
         val pid = np.persistentId
         val key = "${np.title}|${np.artist}"
+        val now = android.os.SystemClock.elapsedRealtime()
 
         // 封面按「曲目 + ftid」双键绑定：接收端（MacPlay NowPlayingState）用
         // coverKey(id, trackID) 存图，换曲目后同一个 ftid 在新曲目下查不到图，
@@ -431,31 +435,21 @@ object SessionController {
         // 混帧的 lyric 就写着这张图真正属于哪首歌 —— 直接按它登记归属。
         // 否则 A 的图会先被 B 认领，两首歌的封面就此互换（18:54 梦醒时分/阿拉善）。
         if (mixedFrame && rawHash != 0) {
-            titleToPid[lyricTitle]?.let { artworkOwners[rawHash] = it }
+            titleToPid[lyricTitle]?.let { artworkOwners[rawHash] = it to now }
         }
-        val owner = artworkOwners[artHash]
+        // 归属带时效：只拦「最近 30 秒内刚判给别的曲目」的图。
+        // 永久归属会把一次误判固化——早期实测 18:59：24460B 被误判给《月亮》后，
+        // 《K.》再想认领就被永久拒绝，封面一直空着。30 秒足够覆盖切歌混帧的时间尺度，
+        // 又不会让错误一直生效。
+        val ownerEntry = artworkOwners[artHash]
+        val owner = ownerEntry?.first
+        val ownerFresh = ownerEntry != null && now - ownerEntry.second <= ARTWORK_OWNER_TTL_MS
         val foreign =
             cached == null && art != null && pid != null &&
                 (
-                    (owner != null && owner != pid) ||
+                    (ownerFresh && owner != pid) ||
                         (prevArtHashes.contains(rawHash) && artworkTrackId != pid)
                 )
-        // 「一直被指向某个曲目」的自愈：归属表也可能是错的（混帧会把 A 的图记到 B）。
-        // 若同一张图连续 3 帧都被当前曲目指向，就改判给它——约 6 秒内自愈。
-        if (foreign && !sameTrack && pid != null && rawHash != 0) {
-            if (rawHash == streakHash && pid == streakPid) {
-                streakCount++
-            } else {
-                streakHash = rawHash
-                streakPid = pid
-                streakCount = 1
-            }
-        } else {
-            streakHash = 0
-            streakPid = null
-            streakCount = 0
-        }
-        val foreignOverride = streakCount >= 3
         // 归属优先：只要这张图已经属于别的曲目，一律不采用。
         // 早期放了「同专辑可共用」的例外，实测被脏数据钻空——CarLife 的 album 字段
         // 在切歌时会短暂沿用上一首，于是"同专辑"成立、别人的图被收下
@@ -466,17 +460,10 @@ object SessionController {
                 art == null -> false
                 mixedFrame && cached == null -> false // 混帧里的图不采信
                 cached != null -> true // 缓存命中的图必然属于该曲目
-                foreign && !foreignOverride -> false
+                foreign -> false
                 sameTrack -> artHash != artworkHash
                 else -> true
             }
-        if (foreign && foreignOverride && !sameTrack) {
-            appendLog("EVENT: 封面改判 ${art?.size}B → 曲目 $pid（连续 $streakCount 帧都指向它）")
-            if (pid != null && rawHash != 0) {
-                artworkOwners[rawHash] = pid
-                streakCount = 0
-            }
-        }
         if (art != null && !needUpload && foreign && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
             appendLog(
@@ -508,7 +495,7 @@ object SessionController {
                 // 切歌瞬间或它还没取到封面时冒出来；若把它存进缓存，下次切回这首歌
                 // 就会立刻显示那张占位图（实测 18:44:06「缓存 4363B」）。
                 artworkCache[pid] = art
-                artworkOwners[artHash] = pid
+                artworkOwners[artHash] = pid to now
             }
             appendLog(
                 "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid" +
@@ -559,8 +546,8 @@ object SessionController {
      * 同一张图被判定属于 A 之后，再出现在 B 的帧里就一定是旧图。
      */
     private val artworkOwners =
-        object : LinkedHashMap<Int, Long>(32, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Long>?) = size > 32
+        object : LinkedHashMap<Int, Pair<Long, Long>>(32, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Pair<Long, Long>>?) = size > 32
         }
 
     /** 上次成功发出封面所属的**曲目持久 id**（不是歌名——过渡帧的歌名不可靠）。 */
@@ -585,11 +572,6 @@ object SessionController {
         object : LinkedHashMap<String, Long>(32, 0.75f, true) {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Long>?) = size > 32
         }
-
-    /** 连续「同一张图被同一曲目指向」的计数与对象（归属表自愈用）。 */
-    private var streakHash = 0
-    private var streakPid: Long? = null
-    private var streakCount = 0
 
     /** 当前正在观察的曲目 id。 */
     private var seenPid: Long? = null
@@ -626,9 +608,6 @@ object SessionController {
         seenPid = null
         seenHashes.clear()
         prevArtHashes.clear()
-        streakHash = 0
-        streakPid = null
-        streakCount = 0
         titleToPid.clear()
         lastSkipLoggedPid = null
     }
