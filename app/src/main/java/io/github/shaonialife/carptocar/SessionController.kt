@@ -353,7 +353,7 @@ object SessionController {
      */
     private fun pushNowPlayingAll(force: Boolean = false) {
         val np = buildNowPlaying() ?: return
-        val info = CarLifeHijack.latestCompleteMediaInfo
+        val info = CarLifeHijack.usableMediaInfo()
         val pid = np.persistentId
         val key = "${np.title}|${np.artist}"
         val now = android.os.SystemClock.elapsedRealtime()
@@ -404,17 +404,6 @@ object SessionController {
         val cached = if (pid != null && !sameTrack) artworkCache[pid] else null
         val art = cached ?: raw
         val artHash = art?.contentHashCode() ?: 0
-        // 「这张图已经属于别的曲目」→ CarLife 把旧图塞进了新曲目的帧。
-        // 必须按**图本身的归属**判断，不能只跟最近一次推送比：连续快切时它会同时
-        // 掺进更早曲目的图（实测 18:32:58 把《我好想你》的 27274B 塞给《Dance Monkey》，
-        // 而当时最近一次推送是 4363B 占位图，因此漏判 → 显示中间那首的封面）。
-        // 「这张图不属于当前曲目」——两条独立证据，与是不是同一个曲目无关：
-        //   ① 归属表说它属于别的曲目；
-        //   ② 它就是上一个曲目最后一张图（CarLife 切歌时必发一遍）。
-        // 这里**不能**再要求 !sameTrack：缓存命中会先把本曲目绑定好，
-        // 紧接着上一首的图（或更早曲目的图）才姗姗来迟，若同曲目分支不查归属，
-        // 就会把它当成"本曲目的新图"收下。实测 18:48:24 半秒内连推三张：
-        //   19360B（缓存，正确）→ 23567B（别的曲目）→ 21135B（又一首）
         // ── 混帧识别 ────────────────────────────────────────────────
         // CarLife 在快速切换时会把两首歌的字段拼进同一帧：`song` 已经换成新歌，
         // 而 `art`/`dur`/`lyric` 还留在上一首。这类帧的 lyric 一定是占位形式
@@ -437,6 +426,13 @@ object SessionController {
         if (mixedFrame && rawHash != 0) {
             titleToPid[lyricTitle]?.let { artworkOwners[rawHash] = it to now }
         }
+        // 「这张图不属于当前曲目」——两条独立证据，与是不是同一个曲目无关：
+        //   ① 归属表说它属于别的曲目（带时效，见下）；
+        //   ② 它就是上一个曲目出现过的图（CarLife 切歌时必发一遍）。
+        // 不能要求 !sameTrack：缓存命中会先把本曲目绑定好，紧接着别人的图才姗姗来迟，
+        // 若同曲目分支不查归属就会收下（实测 18:48:24 半秒内连推三张：
+        //   19360B 缓存正确 → 23567B 别的曲目 → 21135B 又一首）。
+        //
         // 归属带时效：只拦「最近 30 秒内刚判给别的曲目」的图。
         // 永久归属会把一次误判固化——早期实测 18:59：24460B 被误判给《月亮》后，
         // 《K.》再想认领就被永久拒绝，封面一直空着。30 秒足够覆盖切歌混帧的时间尺度，
@@ -633,7 +629,10 @@ object SessionController {
         val hijacking = CarLifeHijack.isHijacking
         // 只读「完整帧」：残缺帧的 song 其实是歌手名，出网会让车机歌名/曲目 id 乱跳，
         // 进而把封面绑到错误的曲目上（链路内部重建 np 时也走这里）。
-        val carlifeInfo = CarLifeHijack.latestCompleteMediaInfo
+        // 兜底：若某首歌的帧始终不带歌手字段（残缺帧判定会把它们全部挡掉），
+        // 完整帧就会一直停在上一首，表现为"卡住不更新"。超过 5 秒仍无新的完整帧时，
+        // 退回原始帧——歌名可能是歌手名，但总比一直显示上一首好。
+        val carlifeInfo = CarLifeHijack.usableMediaInfo()
         if (carlifeInfo != null && carlifeInfo.song.isNotBlank() &&
             (!hijacking || CarLifeHijack.isMediaInfoFresh(60_000L))
         ) {

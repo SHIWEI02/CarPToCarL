@@ -153,6 +153,30 @@ object CarLifeHijack {
     var latestCompleteMediaInfo: CarLifeMediaInfo? = null
         private set
 
+    /** 完整帧的到达时刻（elapsedRealtime）。 */
+    @Volatile
+    private var latestCompleteAt = 0L
+
+    /**
+     * 下游（0x5001 构建 / 封面判定）应当读取的媒体信息。
+     *
+     * 默认只给**完整帧**：残缺帧的 song 其实是歌手名，出网会让车机歌名与曲目 id 乱跳。
+     * 但如果某首歌的帧始终不带歌手字段，完整帧就会一直停在上一首——表现为「卡住不更新」。
+     * 因此完整帧超过 5 秒没更新、而原始帧仍在来时，退回原始帧：歌名可能不准，
+     * 总好过一直显示上一首。
+     */
+    fun usableMediaInfo(): CarLifeMediaInfo? {
+        val complete = latestCompleteMediaInfo
+        val raw = latestMediaInfo
+        if (complete == null) return raw
+        if (raw != null && raw.partial &&
+            android.os.SystemClock.elapsedRealtime() - latestCompleteAt > 5_000L
+        ) {
+            return raw
+        }
+        return complete
+    }
+
     /**
      * 媒体信息是否「新鲜」（默认 10 秒内更新过）。
      *
@@ -1073,7 +1097,10 @@ object CarLifeHijack {
         latestMediaInfo = info
         latestMediaInfoAt = android.os.SystemClock.elapsedRealtime()
         // 残缺帧（artist 为空）只更新原始缓存，不进「完整版」——后者才允许出网。
-        if (!info.partial) latestCompleteMediaInfo = info
+        if (!info.partial) {
+            latestCompleteMediaInfo = info
+            latestCompleteAt = android.os.SystemClock.elapsedRealtime()
+        }
         // 指纹用封面**内容哈希**而不是字节数：CarLife 重新编码同一张图时字节数可能不变
         // 而内容不同，比字节数会漏掉这次变化，导致要等 5s 的进度补推才更新封面。
         val fingerprint = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.contentHashCode() ?: 0}"
