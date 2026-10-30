@@ -379,13 +379,21 @@ object SessionController {
                 it.size >= ARTWORK_MIN_BYTES && !info.partial && pid != null
             }
         val rawHash = raw?.contentHashCode() ?: 0
-        // 记录「上一个曲目最后一张图」。切歌时 CarLife 会把这张图再发一遍。
-        if (raw != null) {
-            if (pid != lastSeenPid) {
-                prevRawArtHash = lastSeenArtHash
-                lastSeenPid = pid
+        // 记录「上一个曲目期间出现过的所有封面」，用于拦截切歌后仍被补发的旧图。
+        // 必须用**未过滤**的原始图做记录：占位灰图（4363B）虽然不采用，但它同样是
+        // 那一帧的内容；早期只记 raw（已过滤），结果灰图那一帧什么都不记，链就断了。
+        // 实测 18:52:28：樱花草先来一帧灰图 4363B，紧接着一帧 19512B（上一首《落缘》
+        // 的图，lyric 还是"落缘 - 李玉刚"），因为 19512 从没被记为"上一首的图"，
+        // 就被当成樱花草的封面推了出去，8.4 秒后才被真图 22396B 纠正。
+        val anyArt = info?.albumArt
+        if (anyArt != null && pid != null) {
+            if (pid != seenPid) {
+                prevArtHashes.clear()
+                prevArtHashes.addAll(seenHashes)
+                seenPid = pid
+                seenHashes.clear()
             }
-            lastSeenArtHash = rawHash
+            if (seenHashes.size < 8) seenHashes.add(anyArt.contentHashCode())
         }
         val sameTrack = pid != null && artworkTrackId == pid
         // 该曲目播过：直接用缓存图，不必等 CarLife 慢吞吞地推（实测 0.5~6.6s）。
@@ -408,7 +416,7 @@ object SessionController {
             cached == null && art != null && pid != null &&
                 (
                     (owner != null && owner != pid) ||
-                        (prevRawArtHash != 0 && rawHash == prevRawArtHash && artworkTrackId != pid)
+                        (prevArtHashes.contains(rawHash) && artworkTrackId != pid)
                 )
         // 归属优先：只要这张图已经属于别的曲目，一律不采用。
         // 早期放了「同专辑可共用」的例外，实测被脏数据钻空——CarLife 的 album 字段
@@ -526,14 +534,19 @@ object SessionController {
     /** 已就「跳过旧封面」打过日志的曲目，避免每个进度周期刷屏。 */
     private var lastSkipLoggedPid: Long? = null
 
-    /** 最近一次观察到的曲目 id（用于记录「上一个曲目的最后一张图」）。 */
-    private var lastSeenPid: Long? = null
+    /** 当前正在观察的曲目 id。 */
+    private var seenPid: Long? = null
 
-    /** 上一个曲目最后一张封面图的哈希（切歌时 CarLife 会把它再发一遍）。 */
-    private var lastSeenArtHash = 0
+    /** 当前曲目期间出现过的封面哈希（未过滤，含占位图）。 */
+    private val seenHashes = LinkedHashSet<Int>()
 
-    /** 「上一个曲目的最后一张图」的哈希，用于精确拦截切歌瞬间的旧图。 */
-    private var prevRawArtHash = 0
+    /**
+     * 上一个曲目期间出现过的所有封面哈希。
+     *
+     * 切歌后 CarLife 会把其中一张再发一遍，命中即判旧图。用集合而不是单个哈希：
+     * 同一首歌播放中封面可能变过（占位灰图 → 真图），只记最后一张会漏。
+     */
+    private val prevArtHashes = HashSet<Int>()
 
     /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null
@@ -553,9 +566,9 @@ object SessionController {
         // 所以不再补传，但 0x5001 仍在宣告 artwork_ftid，接收端有 id 无文件。
         artworkHash = 0
         artworkTrackId = null
-        lastSeenPid = null
-        lastSeenArtHash = 0
-        prevRawArtHash = 0
+        seenPid = null
+        seenHashes.clear()
+        prevArtHashes.clear()
         lastSkipLoggedPid = null
     }
 
