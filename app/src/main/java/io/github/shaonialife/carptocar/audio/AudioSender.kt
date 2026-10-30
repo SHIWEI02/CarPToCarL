@@ -77,6 +77,35 @@ class AudioSender(
      * 「包没丢、抖动 1.26ms、解码 100%，但听起来断续」。96k 仍只有 PCM 的 1/16。
      */
     private val opusBitRate: Int = 96_000,
+    /**
+     * OPUS 编码器内部率（Hz），仅 [AudioCodec.OPUS] 生效。
+     *
+     * 默认 48000（与 RTP 时钟一致，旧行为：16k 源先上采样到 48k 再编）。
+     * 设 16000 即「原生 16k 编码」——让 Opus 直接吃 16k 导航 TTS，
+     * 跳过 [alignPcm] 的 16k→48k 上采样与抗成像低通（成像噪声/亮度损失的来源）。
+     *
+     * 注意 RTP 时钟仍锁定 48k（RFC 7587）：时间戳步进恒为 960 样本/帧，
+     * 与这里填 48k 还是 16k **无关**——[samplesPerPacket] 对 OPUS 永远取
+     * [OpusEncoder.FRAME_SAMPLES]=960。所以原生 16k 不会让车机变速。
+     *
+     * 默认由调用方按 settings.alt_opus_native 决定（SessionController），
+     * 这里只是给一个安全的 48k 兜底值。
+     */
+    private val opusInternalRate: Int = 48_000,
+    /**
+     * RTP 冗余帧级数（RFC 2198）。0 = 关闭（默认，行为完全不变）。
+     * 1..7 = 每包额外携带最近 N 个历史帧的副本，抗 WiFi 丢包——
+     * 丢一包时接收端能从后续包里恢复，避免车内 WiFi 抖动爆音/断字。
+     *
+     * 代价：每包变大（≈ 1+级数 倍），且 SETUP 必须同时声明
+     * `supportsRTPPacketRedundancy=true`（见 [airplay.AirPlayClient.runAudioStream]）。
+     * **仅对压缩编码（AAC/OPUS）生效**：PCM 一帧 48k 立体声 ≈ 1.9KB，翻倍即超
+     * 1500B MTU 会被分片/丢弃，所以 PCM 通路强制不走冗余。
+     *
+     * 默认 0（关闭）是为了安全：此格式必须与车机严格一致，开启后需真机验证；
+     * 未开启时一切沿用旧路径。
+     */
+    private val rtpRedundancyLevels: Int = 0,
 ) {
     companion object {
         const val CHANNELS = 2
@@ -168,6 +197,17 @@ class AudioSender(
     /** 滤波器状态被重置的次数（>1 说明源采样率在变，会引入瞬态咔哒）。 */
     private var filterResets = 0
 
+    /**
+     * RTP 冗余用的历史帧环形缓冲：每条 = (已编码负载, 该包 RTP 时间戳)。
+     * 仅缓存最近 [rtpRedundancyLevels] 条，供后续包作为冗余块重发。
+     * 只用压缩编码（AAC/OPUS）的负载，PCM 不通冗余。
+     */
+    private data class RedEntry(val payload: ByteArray, val ts: Long)
+
+    private val redHistory =
+        if (rtpRedundancyLevels > 0) ArrayDeque<RedEntry>(rtpRedundancyLevels + 1) else null
+    private var redLogged = false
+
     // ---- 诊断（2026-10-29）：定位「卡顿 + 沙沙」----
     /** 喂入次数 / 成功发包数 / 源包间隔统计。 */
     private var fedCount = 0
@@ -232,7 +272,7 @@ class AudioSender(
         get() =
             when (codec) {
                 AudioCodec.AAC_LC -> AacLcEncoder.pcmBytes(channels)
-                AudioCodec.OPUS -> OpusEncoder.pcmBytes()
+                AudioCodec.OPUS -> OpusEncoder.pcmBytes(opusInternalRate)
                 else -> samplesPerPacket.toInt() * channels * 2
             }
 
@@ -450,8 +490,10 @@ class AudioSender(
                 }
                 aacEncoder = encoder
             } else if (codec == AudioCodec.OPUS) {
-                // 码率对齐 Apple 48kHz 档位（96kbps），见 [opusBitRate] 的说明。
-                val encoder = OpusEncoder(sampleRate, bitRate = opusBitRate, log = log)
+                // OPUS 直接吃 [opusInternalRate]（默认 16k 原生）：把 16k 导航 TTS
+                // 喂给编码器，不再先上采样到 48k。RTP 时钟仍是 48k（见 [samplesPerPacket]），
+                // 所以车机排播节奏不变。码率对齐 Apple 档位（96kbps），见 [opusBitRate]。
+                val encoder = OpusEncoder(opusInternalRate, bitRate = opusBitRate, log = log)
                 if (!encoder.start()) {
                     client.close()
                     socket = null
@@ -537,11 +579,15 @@ class AudioSender(
     }
 
     /**
-     * 把一段 PCM 重采样到 [sampleRate] 立体声，返回新数组；无需处理时返回原输入。
+     * 把一段 PCM 对齐到目标采样率/声道，返回新数组；无需处理时返回原输入。
      *
-     * 只做两种常见比值的线性重采样（44.1k↔48k）+ 声道扩展，避免引入第三方重采样库：
-     * CarLife 引擎实际只会输出 44.1k 或 48k。其它任意比值退化为按 [sampleRate] 直接
-     * 截断/复读，保证不出错（宁可有轻微音高偏移，也不中断推流）。
+     * 目标率按通路区分：
+     *  - **OPUS**：走 [opusInternalRate]（默认 16k 原生）。16k 源直接透传，
+     *    跳过 16k→48k 上采样与抗成像低通——那道多余的上采样正是成像噪声与
+     *    亮度损失的来源，应交由 Opus 自己按内部率处理（RFC 7587：RTP 时钟仍 48k）。
+     *  - **PCM/AAC**：走协商的 RTP 时钟率 [sampleRate]（通常 48k）。
+     *
+     * 媒体（44.1k/48k）走原线性插值路径；导航 TTS（16k）在原生模式下零处理。
      */
     private fun alignPcm(
         src: ByteArray,
@@ -551,11 +597,14 @@ class AudioSender(
     ): ByteArray {
         val inRate = if (srcRate > 0) srcRate else sampleRate
         val inCh = if (srcChannels == 1) 1 else 2
+        // OPUS 走**原生内部率**，其余通路走协商的 RTP 时钟率。
+        val targetRate = if (codec == AudioCodec.OPUS) opusInternalRate else sampleRate
+        val targetCh = if (codec == AudioCodec.OPUS) 1 else channels
 
-        // 先处理声道：单声道 → 立体声（复制到左右）
+        // 声道对齐：单→双（复制）、双→单（取左，导航 TTS 本就单声道内容）。
         var rateAligned: ByteArray
         var rateChannels = inCh
-        if (inCh == 1 && channels == 2) {
+        if (inCh == 1 && targetCh == 2) {
             val monoFrames = size / 2
             val out = ByteArray(monoFrames * 4)
             var i = 0
@@ -572,44 +621,56 @@ class AudioSender(
             }
             rateAligned = out
             rateChannels = 2
+        } else if (inCh == 2 && targetCh == 1) {
+            val frames = size / 4
+            val out = ByteArray(frames * 2)
+            var i = 0
+            var o = 0
+            while (i + 3 < size) {
+                out[o] = src[i]
+                out[o + 1] = src[i + 1]
+                i += 4
+                o += 2
+            }
+            rateAligned = out
+            rateChannels = 1
         } else {
             rateAligned = if (size == src.size) src else src.copyOf(size)
         }
 
-        // 采样率一致直接返回
-        if (inRate == sampleRate) return rateAligned
+        // 采样率已一致（且声道已对齐）直接返回：OPUS 原生 16k 走这里，跳过全部重采样。
+        if (inRate == targetRate) return rateAligned
 
         // 线性插值重采样（frame = 所有声道的一组采样）
         //
         // 2026-10-29 改进（对齐 origin/main 6b1638b）：原实现是**最近邻取整**
-        // （srcPos = frame * inRate / sampleRate）。媒体 48k 直通不受影响，但导航
-        // TTS 是 16kHz → 48kHz 的三倍上采样，最近邻等于把每个样本复制三遍，
-        // 高频台阶噪声明显，语音听起来发毛、发尖，与「播报开头卡顿」叠加后更明显。
+        // （srcPos = frame * inRate / targetRate）。媒体 48k 直通不受影响；原生 16k
+        // OPUS 模式下此分支根本不会进入（inRate==targetRate 已提前返回）。
         val inFrames = rateAligned.size / (rateChannels * 2)
-        val outFrames = (inFrames.toLong() * sampleRate / inRate).toInt()
-        val out = ByteArray(outFrames * channels * 2)
+        val outFrames = (inFrames.toLong() * targetRate / inRate).toInt()
+        val out = ByteArray(outFrames * targetCh * 2)
         val inSamples = rateAligned.size / 2
-        val step = inRate.toDouble() / sampleRate
+        val step = inRate.toDouble() / targetRate
         val lastFrame = maxOf(0, inFrames - 1)
         for (frame in 0 until outFrames) {
             val pos = frame * step
             val i0 = pos.toInt().coerceIn(0, lastFrame)
             val i1 = minOf(i0 + 1, lastFrame)
             val frac = pos - i0
-            for (c in 0 until channels) {
+            for (c in 0 until targetCh) {
                 val srcCh = minOf(c, rateChannels - 1)
                 val s0 = readS16(rateAligned, i0 * rateChannels + srcCh, inSamples)
                 val s1 = readS16(rateAligned, i1 * rateChannels + srcCh, inSamples)
                 val v = (s0 + (s1 - s0) * frac).toInt().coerceIn(-32768, 32767)
-                val dst = (frame * channels + c) * 2
+                val dst = (frame * targetCh + c) * 2
                 out[dst] = (v and 0xFF).toByte()
                 out[dst + 1] = ((v shr 8) and 0xFF).toByte()
             }
         }
 
-        // 抗成像低通（仅上采样路径）。
+        // 抗成像低通（仅上采样路径：targetRate > inRate）。
         //
-        // 源带宽只到 inRate/2。线性插值把采样率抬到 sampleRate 后，inRate/2 之上
+        // 源带宽只到 inRate/2。线性插值把采样率抬到 targetRate 后，inRate/2 之上
         // 会复制出镜像——线性插值核是三角窗，频响 sinc²，16k→48k 时 8kHz 处只
         // 衰减 3.5dB、10kHz 处 5dB，衰减远远不够，听感是持续的「沙沙」高频噪声。
         //
@@ -620,11 +681,14 @@ class AudioSender(
         //
         // 两级 Butterworth 二阶低通（合计 4 阶、-24dB/oct）在 0.45×inRate 处切。
         // 实测：8–12kHz 镜像相对语音核心 -54.6dB，已在掩蔽阈值以下。
-        if (inRate < sampleRate) {
+        //
+        // 原生 16k 模式下 inRate==targetRate 已提前返回，不会进入此分支；
+        // 仅在回落 48k（alt_opus_native=false）时才走滤波。
+        if (inRate < targetRate) {
             val fc = inRate * 0.45
             if (fc != antiImageFc) {
                 antiImageFc = fc
-                antiImageCoeffs = lowpassCoeffs(fc)
+                antiImageCoeffs = lowpassCoeffs(fc, targetRate)
                 // 源采样率变了（切换音源），状态清零避免残留瞬态
                 for (st in antiImageState) st.fill(0.0)
                 // 显式记一行，免得「到底有没有走滤波」只能靠猜。
@@ -633,7 +697,7 @@ class AudioSender(
                 filterResets++
                 log(
                     "AUDIO-FILTER[$streamType]: 抗成像低通 fc=${fc.toInt()}Hz " +
-                        "（${inRate}Hz → ${sampleRate}Hz）第 $filterResets 次重置",
+                        "（${inRate}Hz → ${targetRate}Hz）第 $filterResets 次重置",
                 )
             }
             applyAntiImage(out)
@@ -645,8 +709,8 @@ class AudioSender(
      * 按截止频率算两级 Butterworth 二阶低通系数。
      * 返回 `[b0, b1, b2, a1, a2]`，已按 a0 归一化（Q = 1/√2 即 Butterworth）。
      */
-    private fun lowpassCoeffs(fc: Double): DoubleArray {
-        val w0 = 2.0 * Math.PI * fc / sampleRate
+    private fun lowpassCoeffs(fc: Double, rate: Int = sampleRate): DoubleArray {
+        val w0 = 2.0 * Math.PI * fc / rate
         val cosW = Math.cos(w0)
         val alpha = Math.sin(w0) / (2.0 * 0.70710678)
         val a0 = 1.0 + alpha
@@ -777,6 +841,8 @@ class AudioSender(
         syncThread = null
         thread = null
         passthroughBuffer.reset()
+        redHistory?.clear()
+        redLogged = false
         restorePhoneMedia()
         log("AUDIO: 已停止（共发 $packetsSent 包 / ${bytesSent / 1024}KB）")
     }
@@ -1018,11 +1084,33 @@ class AudioSender(
             val after = android.os.SystemClock.uptimeMillis()
             if (after - nextSendAt > 200L) nextSendAt = after
         }
-        val wire = sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
+        // RTP 冗余仅在「开启 且 压缩编码」时生效；PCM 大帧会撑爆 MTU，强制走普通路径。
+        val useRed = rtpRedundancyLevels > 0 && codec != AudioCodec.PCM && redHistory != null
+        val wire =
+            if (useRed) {
+                sealPacketRedundant(payload, sequence, timestamp, nonceCounter, markerPending, rtpRedundancyLevels)
+            } else {
+                sealPacket(payload, sequence, timestamp, nonceCounter, markerPending)
+            }
         markerPending = false
+        val thisTs = timestamp
         sequence = (sequence + 1) and 0xFFFF
         timestamp += samplesPerPacket
         nonceCounter++
+        if (useRed) {
+            redHistory!!.addLast(RedEntry(payload, thisTs))
+            while (redHistory!!.size > rtpRedundancyLevels) redHistory!!.removeFirst()
+            if (!redLogged) {
+                redLogged = true
+                log(
+                    "AUDIO: RTP 冗余已启用（级数=$rtpRedundancyLevels，" +
+                        "${if (codec == AudioCodec.OPUS) "OPUS" else "AAC-LC"} 通路，每包抗 ${rtpRedundancyLevels} 帧丢包）",
+                )
+            }
+        } else if (rtpRedundancyLevels > 0 && codec == AudioCodec.PCM && !redLogged) {
+            redLogged = true
+            log("AUDIO: RTP 冗余对 PCM 通路关闭（48k 立体声帧过大，冗余会超 MTU 被分片）——仅 AAC/OPUS 生效")
+        }
         val client = socket ?: return false
         return try {
             client.send(DatagramPacket(wire, wire.size))
@@ -1075,8 +1163,6 @@ class AudioSender(
         marker: Boolean = false,
     ): ByteArray {
         val header = buildRtpHeader(sequence, timestamp, marker)
-        // AAD = header 的 timestamp+ssrc 段（字节 4..12）——catplay "modern AAD" / DiPlay 解密同款
-        val aad = header.copyOfRange(4, RTP_HEADER_LEN)
         // 关键：CarPlay 线格式的 LPCM 是**大端** s16 样本——接收端对收到的负载做
         // byteSwapS16 转回小端再喂 AudioTrack（DiPlay AndroidMediaSink.kt:1687）。
         // Android 采集是原生小端，因此这里必须换序；漏掉会得到「沙沙声」（2026-10-10 实测）。
@@ -1086,6 +1172,72 @@ class AudioSender(
         // 只有裸 PCM 是 16bit 样本序列，需要换序；AAC / OPUS 都是**压缩字节流**，
         // 换序会把比特流搅烂（车机解码失败 → 有包无声）。
         val wirePayload = if (codec == AudioCodec.PCM) bigEndianS16(pcm) else pcm
+        return assembleWire(header, wirePayload, nonceCounter)
+    }
+
+    /**
+     * 组一个带 RFC 2198 冗余的 RTP 包。
+     *
+     * 结构（明文）：[N×4 字节冗余块头][1 字节主块头][N 个冗余数据块][主数据块]。
+     * 每个冗余块头 4 字节：`|F=1|PT(7)|tsOffset(14)|len(10)|`；主块头 1 字节 `|F=0|PT(7)|`。
+     * 冗余块头里的 tsOffset = 主包 RTP 时间戳 − 该冗余块时间戳（单位与 RTP 时钟一致，
+     * 即音频样本数），len = 该冗余块字节数（≤1023）。
+     *
+     * 这是 AirPlay 2 实时音频丢包补偿的标准做法（openairplay 接收端明确按 RFC 2198 解析），
+     * 车机端据此在丢包时从后续包恢复——与 iPhone 的无线 CarPlay 行为一致。
+     *
+     * 注意：一旦开了冗余，载荷**必须**按此结构封装（哪怕 0 个冗余块也要有那 1 字节主块头），
+     * 否则接收端按冗余格式解析会直接坏掉——所以关闭时走 [sealPacket] 普通路径，不调用这里。
+     */
+    internal fun sealPacketRedundant(
+        pcm: ByteArray,
+        sequence: Int,
+        timestamp: Long,
+        nonceCounter: Long,
+        marker: Boolean,
+        levels: Int,
+    ): ByteArray {
+        val header = buildRtpHeader(sequence, timestamp, marker)
+        val history = redHistory ?: return sealPacket(pcm, sequence, timestamp, nonceCounter, marker)
+        val n = minOf(levels, history.size)
+        // 取最近 n 条（最旧..最新）。
+        val start = history.size - n
+        val headerBytes = ByteArray(n * 4 + 1)
+        var p = 0
+        for (i in 0 until n) {
+            val entry = history[start + i]
+            val tsOffset = (timestamp - entry.ts).toInt().coerceIn(0, 0x3FFF)
+            val len = entry.payload.size.coerceAtMost(0x3FF)
+            // F=1（后面还有主块头），PT=streamType 低 7 位
+            headerBytes[p++] = (0x80 or (streamType.toInt() and 0x7F)).toByte()
+            headerBytes[p++] = ((tsOffset ushr 6) and 0xFF).toByte()
+            headerBytes[p++] = (((tsOffset and 0x3F) shl 2) or ((len ushr 8) and 0x03)).toByte()
+            headerBytes[p++] = (len and 0xFF).toByte()
+        }
+        // 主块头：F=0，PT=streamType 低 7 位
+        headerBytes[p] = (streamType.toInt() and 0x7F).toByte()
+        // 数据块：先 n 个冗余（按头顺序），再主数据（当前 pcm，已是编码后字节流）
+        var dataBytes = pcm.size
+        for (i in 0 until n) dataBytes += history[start + i].payload.size
+        val structure = ByteArray(dataBytes)
+        var q = 0
+        for (i in 0 until n) {
+            val entry = history[start + i]
+            entry.payload.copyInto(structure, q)
+            q += entry.payload.size
+        }
+        pcm.copyInto(structure, q)
+        return assembleWire(header, structure, nonceCounter)
+    }
+
+    /** [头][ChaCha20密封(负载)+tag][8字节小端nonce] 拼装（加密对冗余结构透明）。 */
+    private fun assembleWire(
+        header: ByteArray,
+        wirePayload: ByteArray,
+        nonceCounter: Long,
+    ): ByteArray {
+        // AAD = header 的 timestamp+ssrc 段（字节 4..12）——catplay "modern AAD" / DiPlay 解密同款
+        val aad = header.copyOfRange(4, RTP_HEADER_LEN)
         val sealed = AirPlayCrypto.chachaSeal(streamKey, AirPlayCrypto.nonce64(nonceCounter), wirePayload, aad)
         val wire = ByteArray(RTP_HEADER_LEN + sealed.size + NONCE_SIZE)
         header.copyInto(wire, 0)
@@ -1097,6 +1249,7 @@ class AudioSender(
         }
         return wire
     }
+
 
     private fun buildRtpHeader(
         sequence: Int,

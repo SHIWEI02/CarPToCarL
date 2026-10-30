@@ -14,7 +14,9 @@ import android.media.MediaFormat
  *  - MacPlay 虽然收下（SETUP 200），但**4080 包只有 406 包能解码**，
  *    听感是「卡顿杂音、几乎无法分辨」——PCM 被当 OPUS 解码的典型症状。
  *
- * 线格式：RTP 负载 = **裸 OPUS 包**（一包一帧，20ms = 960 样本 @48kHz）。
+ * 线格式：RTP 负载 = **裸 OPUS 包**（一包一帧，固定 20ms）。RTP 时间戳按 **960 样本
+ * @48kHz 时钟**步进（RFC 7587，与编码器内部率解耦）；编码器内部率可配 16k/48k——
+ * 16k 即「原生 16k 编码」，直接吃 16k 导航 TTS，省掉上采样（见 [OpusEncoder]）。
  * Android `MediaCodec` 的 `audio/opus` 编码器每帧输出一个裸 OPUS 包，可直接用。
  * 注意首帧可能带 CSD 头（identification header），按输出 buffer 的 flags 跳过。
  */
@@ -24,11 +26,18 @@ class OpusEncoder(
     private val log: (String) -> Unit,
 ) {
     companion object {
-        /** OPUS 一帧固定 20ms = 960 样本（@48kHz）。 */
+        /** OPUS 一帧固定 20ms = 960 样本（@48kHz）。同时也是 RTP 时钟帧：
+         * 无论编码内部率是 16k 还是 48k，RTP 时间戳都按 960 样本/帧步进（RFC 7587）。 */
         const val FRAME_SAMPLES = 960
 
-        /** 一帧 PCM 的字节数（16bit 单声道）。 */
-        fun pcmBytes(): Int = FRAME_SAMPLES * 2
+        /** RTP 时钟恒为 48kHz（RFC 7587）：OPUS 的 RTP 时间戳与 spf 一律按此率计算，
+         * 与编码内部率（[OpusEncoder] 的 sampleRate）解耦——这是「原生 16k 编码、
+         * 省掉 16k→48k 上采样」仍能正确对接车机的根因。 */
+        const val RTP_CLOCK_RATE = 48_000
+
+        /** 一帧 PCM 的字节数（16bit 单声道），按给定采样率算：
+         *  16k → 640B（320 样本）、48k → 1920B（960 样本）。 */
+        fun pcmBytes(rate: Int = RTP_CLOCK_RATE): Int = rate * 20 / 1000 * 2
 
         private const val MIME = "audio/opus"
         private const val TIMEOUT_US = 10_000L
@@ -85,6 +94,12 @@ class OpusEncoder(
 
     private var codec: MediaCodec? = null
 
+    /** 本编码器内部帧样本数（20ms @ sampleRate）：16k → 320，48k → 960。 */
+    private val inputFrameSamples = sampleRate * 20 / 1000
+
+    /** 本编码器每帧输入的 PCM 字节数（16bit 单声道）。 */
+    private val inputPcmBytes = inputFrameSamples * 2
+
     /**
      * 待喂给编码器的 PCM 帧。MediaCodec 的输入 buffer 可能一时拿不到
      * （编码器还在处理上一批），拿不到时数据留在这里，绝不丢弃。
@@ -110,7 +125,7 @@ class OpusEncoder(
             val format =
                 MediaFormat.createAudioFormat(MIME, sampleRate, 1).apply {
                     setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
-                    setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, pcmBytes() * 4)
+                    setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, inputPcmBytes * 4)
                     // OPUS 的复杂度 0~10，5 是速度/质量平衡点（语音够用）
                     setInteger(MediaFormat.KEY_COMPLEXITY, 5)
                 }
@@ -121,7 +136,7 @@ class OpusEncoder(
             inputDone = false
             outputDone = false
             pendingFrames.clear()
-            log("OPUS: 编码器已启动（${sampleRate}Hz mono ${bitRate}bps，一帧 ${FRAME_SAMPLES} 样本）")
+            log("OPUS: 编码器已启动（${sampleRate}Hz mono ${bitRate}bps，一帧 ${inputFrameSamples} 样本 / ${inputPcmBytes}B）")
             true
         } catch (error: Exception) {
             log("OPUS: 编码器启动失败 - ${error.message}")

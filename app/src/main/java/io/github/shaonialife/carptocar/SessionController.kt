@@ -1603,6 +1603,9 @@ object SessionController {
             return false
         }
         return try {
+            val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+            // RTP 冗余级数：settings.audio_rtp_redundancy（0=关，1..7=级数）。见 AudioSender。
+            val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 0).coerceIn(0, 7)
             // 车机身份 → 只用于「本车机哪些音频档位踩过雷」的持久化记忆。
             val identity = client.receiverIdentity()
             // 音频封装参数已定案（见 AudioTuning），不再提供切换
@@ -1632,7 +1635,7 @@ object SessionController {
             var chosen: AudioProfile? = null
             var streamInfo: AirPlayClient.AudioStreamInfo? = null
             for (candidate in ordered) {
-                val result = client.runAudioStream(sharedSecret, candidate, tuning)
+                val result = client.runAudioStream(sharedSecret, candidate, tuning, rtpRedundancy > 0)
                 if (result != null) {
                     chosen = candidate
                     streamInfo = result
@@ -1672,6 +1675,7 @@ object SessionController {
                     // 同步包目标端口：车机在 SETUP 应答里下发。缺了它就没有 RTP↔NTP 锚点，
                     // 接收端只能「按到达时刻猜」，严格的实现干脆不排播（2026-10-20 实测）。
                     controlPort = audio.controlPort,
+                    rtpRedundancyLevels = rtpRedundancy,
                 )
             audioSender = sender
             if (!sender.startPassthrough()) {
@@ -1713,6 +1717,8 @@ object SessionController {
     ) {
         val ctx = appContext?.applicationContext ?: return
         val prefs = ctx.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        // RTP 冗余级数：settings.audio_rtp_redundancy（0=关，1..7=级数）。见 AudioSender。
+        val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 0).coerceIn(0, 7)
         if (!prefs.getBoolean("alt_audio_stream_enabled", false)) {
             // 静默跳过太容易误判「代码没跑」——显式记一行
             appendLog("ALT-AUDIO: 未启用（settings.alt_audio_stream_enabled=false）——走单流+静音压制")
@@ -1756,6 +1762,13 @@ object SessionController {
                 if (!useOpus) appendLog("ALT-AUDIO: OPUS 实测不可用——改用 PCM 协商")
             }
         }
+        // 导航延迟：不再写死固定值，而是读接收端 /info 声明的 alert 输出延迟（realtime=true
+        // 低延迟路径，接收端本就最小化缓冲），仅用一个很小的「安全地板」兜底——和 CarPlay
+        // 一样由接收端能力决定、尽量低延迟。地板默认 250ms（实测 200 偶发欠载、400 全稳，
+        // 250 是权衡），可用 settings.alt_audio_latency_floor_ms 覆盖（想更跟手可试 200）。
+        val navLatencyFloor = prefs.getInt("alt_audio_latency_floor_ms", 250).toLong().coerceAtLeast(50)
+        val navLatency = client.realtimeLatency("alert", altType, navLatencyFloor)
+        appendLog("ALT-AUDIO: 导航延迟 = ${navLatency}ms（接收端声明 / 地板 ${navLatencyFloor}ms）")
         val altProfile =
             if (useOpus) {
                 AudioProfile(
@@ -1764,9 +1777,7 @@ object SessionController {
                     // _setupAudio 里 isOpus 时硬编码 sampleRate=48000 channels=1。
                     formatBit = 0x40000000L,
                     sampleRate = 48_000,
-                    // 导航仍比媒体紧，但不再压到 200：实测 200 时 playoutLead 只剩 17.9ms，
-                    // 偶发欠载。400 给一包以上余量，延迟增量对播报可忽略。
-                    latencyMs = 400,
+                    latencyMs = navLatency,
                     streamType = altType,
                     codec = AudioCodec.OPUS,
                     channels = 1,
@@ -1776,7 +1787,7 @@ object SessionController {
                     audioType = "alert",
                     formatBit = 1L shl 15, // PCM 48kHz 16bit 立体声（PCM_FORMAT[0x8000]）
                     sampleRate = 48_000,
-                    latencyMs = 400,
+                    latencyMs = navLatency,
                     streamType = altType,
                     codec = AudioCodec.PCM,
                 )
@@ -1791,7 +1802,7 @@ object SessionController {
         Thread({
             val info =
                 try {
-                    client.runAudioStream(secret, altProfile, AudioTuning.RAW_SPF)
+                    client.runAudioStream(secret, altProfile, AudioTuning.RAW_SPF, rtpRedundancy > 0)
                 } catch (error: Exception) {
                     appendLog("ALT-AUDIO: 协商异常 ${error.message}")
                     null
@@ -1815,6 +1826,15 @@ object SessionController {
                     channels = altProfile.channels,
                     // Apple 48kHz 档位是 96kbps（MacPlay cpStack.js 记录），可留 settings 覆盖做 A/B
                     opusBitRate = prefs.getInt("alt_opus_bitrate", 96_000),
+                    // 原生 16k OPUS：让 Opus 直接吃 16k 导航 TTS，省掉 16k→48k 上采样与
+                    // 抗成像低通。settings.alt_opus_native=false 时回落 48k（旧行为）。
+                    opusInternalRate =
+                        if (useOpus && prefs.getBoolean("alt_opus_native", true)) {
+                            16_000
+                        } else {
+                            48_000
+                        },
+                    rtpRedundancyLevels = rtpRedundancy,
                 )
             if (sender.startPassthrough()) {
                 ttsAudioSender = sender
@@ -1855,12 +1875,15 @@ object SessionController {
         val host = currentAudioHost ?: return false
         val profile = activeAudioProfile ?: return false
         val context = appContext?.applicationContext ?: return false
+        val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
+        // RTP 冗余级数：settings.audio_rtp_redundancy（0=关，1..7=级数）。见 AudioSender。
+        val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 0).coerceIn(0, 7)
         val old = audioSender ?: return false
         if (!old.isRunning) return false
         appendLog("AUDIO: $reason → 重建音频流（接收端音频输出在通话期间被释放，需新建流才会重开）")
         val info =
             try {
-                client.runAudioStream(secret, profile, AudioTuning.RAW_SPF)
+                client.runAudioStream(secret, profile, AudioTuning.RAW_SPF, rtpRedundancy > 0)
             } catch (error: Exception) {
                 appendLog("AUDIO: 重建协商异常 - ${error.message}")
                 null
@@ -1887,6 +1910,7 @@ object SessionController {
                 adtsFrames = AudioTuning.RAW_SPF.adts,
                 controlPort = info.controlPort,
                 channels = profile.channels,
+                rtpRedundancyLevels = rtpRedundancy,
             )
         audioSender = sender
         if (!sender.startPassthrough()) {

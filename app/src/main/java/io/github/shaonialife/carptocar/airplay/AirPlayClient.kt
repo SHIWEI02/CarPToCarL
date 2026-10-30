@@ -1608,7 +1608,22 @@ class AirPlayClient(
          * 转发，延迟会叠加；再拉到 1000 会让音画不同步变得明显。500 是折中：
          * 缓冲余量翻倍，额外延迟仍在一包量级。
          */
-        const val AUDIO_LATENCY_FALLBACK_MS = 500L
+        const val AUDIO_LATENCY_FALLBACK_MS = 800L
+
+        /**
+         * 低延迟流（导航/alert，realtime=true）的延迟下限（ms）。
+         *
+         * 与媒体流的 800ms 地板是两套逻辑：导航走 `realtime=true`，接收端本就**最小化缓冲**
+         * （CarPlay 的设计意图就是提示音及时出声），不能像媒体那样堆大缓冲，否则就白设
+         * realtime=true 了。所以这里只留一个**安全地板**，优先用接收端在 /info 里声明的
+         * alert 输出延迟，没声明时才兜底。
+         *
+         * 取值依据：实测 200ms → playoutLead 只剩 17.9ms（不到一包），偶发欠载；400ms 给
+         * 一包以上余量、完全稳。250 是「明显低于 400、又留出 ~68ms playoutLead」的权衡，
+         * 比 400 更跟手、又不踩 200 的欠载坑。可用 settings `alt_audio_latency_floor_ms`
+         * 覆盖（想更跟手可试 200，但 WiFi 差时会回到欠载）。
+         */
+        const val AUDIO_LATENCY_REALTIME_FLOOR_MS = 250L
 
         /** 车机音量 ≤ 这个值（dB）视为静音位（AirPlay 里 -144 约等于全静音）。 */
         private const val MUTE_THRESHOLD_DB = -100f
@@ -1731,6 +1746,7 @@ class AirPlayClient(
         sharedSecret: ByteArray,
         profile: AudioProfile,
         tuning: AudioTuning = AudioTuning.RAW_SPF,
+        supportsRTPPacketRedundancy: Boolean = false,
     ): AudioStreamInfo? {
         // 档位由调用方按「车机 /info 声明的候选 + 本车机历史记忆」选定后传进来：
         // 同一台车机上不同 audioType 档位的可用性完全不同（见 AudioProfile 注释），
@@ -1765,12 +1781,14 @@ class AirPlayClient(
                                 put("audioType", negotiation.audioType)
                                 put("audioLatencyMs", negotiation.latencyMs)
                                 // 与 catplay 发送端（StreamDescriptionAudio::new）逐字段对齐：
-                                // input=false（只下行，无麦克风上行）、
-                                // supportsRTPPacketRedundancy=false（我们不打包冗余帧）。
+                                // input=false（只下行，无麦克风上行）。
+                                // supportsRTPPacketRedundancy 由调用方按 settings
+                                // `audio_rtp_redundancy` 决定：>0 时开（每包带历史帧副本抗 WiFi 丢包），
+                                // 此时[AudioSender]也必须按 RFC 2198 封装载荷；=0 时关（旧行为）。
                                 // 缺这两个布尔时部分严格实现的接收端会按「未声明=不支持」处理，
                                 // 在音频通路初始化阶段就放弃该流。
                                 put("input", false)
-                                put("supportsRTPPacketRedundancy", false)
+                                put("supportsRTPPacketRedundancy", supportsRTPPacketRedundancy)
                                 put("supportsHighAccuracyTimestamps", tuning.highAccuracyTimestamps)
                                 // spf = 每包样本帧数：AAC 一帧 1024，PCM 走 352。
                                 // 2026-10-20 Honda 实测：不声明 spf 时车机照样收包并按 44.1k
@@ -1948,11 +1966,17 @@ class AirPlayClient(
      *     部分车机 media 档只声明 44.1k 且其音频通路只吃 48k，只能用兼容档；
      *  4. 延迟取该 (type, audioType) 在 audioLatencies 的 outputLatencyMicros，
      *     取不到用 [AUDIO_LATENCY_FALLBACK_MS]。
-     * 拿不到 /info 时回退协议基线（media + PCM48k + 250ms），与改动前一致。
+     * 拿不到 /info 时回退协议基线（media：AAC-LC 48k → AAC-LC 44.1k → PCM48k），
+     * 与无线 CarPlay 主媒体强制 AAC-LC 的标准对齐，PCM 仅作兜底。
      */
     fun audioCandidates(preferCompat: Boolean = false): List<AudioProfile> {
         val baseline =
             listOf(
+                // 无线 CarPlay 主媒体规范强制 AAC-LC（LPCM 仅限有线）。
+                // 即便拿不到 /info，基线也优先 AAC-LC，PCM 仅作兜底——与标准对齐。
+                // 调用方会按候选顺序逐档尝试，AAC-LC 被拒时自动回落 PCM。
+                AudioProfile(AUDIO_TYPE_MEDIA, AUDIO_FORMAT_AAC_48K_STEREO, 48_000, AUDIO_LATENCY_FALLBACK_MS, codec = AudioCodec.AAC_LC),
+                AudioProfile(AUDIO_TYPE_MEDIA, AUDIO_FORMAT_AAC_LC_44K_STEREO, 44_100, AUDIO_LATENCY_FALLBACK_MS, codec = AudioCodec.AAC_LC),
                 AudioProfile(AUDIO_TYPE_MEDIA, AUDIO_FORMAT_PCM_48K_STEREO, 48_000, AUDIO_LATENCY_FALLBACK_MS),
             )
         val info = negotiatedInfo ?: return baseline
@@ -2051,6 +2075,7 @@ class AirPlayClient(
         info: Map<*, *>,
         audioType: String,
         streamType: Long = AUDIO_STREAM_TYPE,
+        floorMs: Long = AUDIO_LATENCY_FALLBACK_MS,
     ): Long {
         val declaredMs =
             (info["audioLatencies"] as? List<*>)
@@ -2061,11 +2086,26 @@ class AirPlayClient(
                 }?.let { (it["outputLatencyMicros"] as? Number)?.toLong() }
                 ?.takeIf { it > 0 }
                 ?.let { it / 1000 }
-        // 下限 250ms：车机声明的 outputLatencyMicros 只是它自己的输出延迟（实测 35ms），
-        // 拿它当端到端缓冲会让 WiFi 抖动直接变成欠载。catplay 对 AirPlay 镜像同样是
-        // `max(声明值, 250ms)`。
-        return declaredMs?.coerceAtLeast(AUDIO_LATENCY_FALLBACK_MS) ?: AUDIO_LATENCY_FALLBACK_MS
+        // 下限 [floorMs]：车机声明的 outputLatencyMicros 只是它自己的输出延迟（实测 ~35ms），
+        // 拿它当端到端缓冲会让 WiFi 抖动直接变成欠载。媒体流地板 800ms（接近现网 iPhone 无线
+        // CarPlay 的 1000–1100ms）；导航/alert 流用更小的 [AUDIO_LATENCY_REALTIME_FLOOR_MS]，
+        // 因为它走 realtime=true、接收端本就最小化缓冲，堆大缓冲反而失去低延迟意义。
+        return declaredMs?.coerceAtLeast(floorMs) ?: floorMs
     }
+
+    /**
+     * 低延迟流（导航/alert，realtime=true）的延迟：**读接收端 /info 声明的 alert 输出延迟**，
+     * 仅用 [AUDIO_LATENCY_REALTIME_FLOOR_MS] 兜底——不写死固定值，做到「像 CarPlay 那样
+     * 由接收端能力决定、尽量低延迟」。
+     *
+     * 复用握手阶段缓存的 [negotiatedInfo]（与媒体流同一次 /info），无需再发一次 RTSP。
+     * 拿不到 /info 或车机未声明 alert 延迟时，回落 [floorMs]（默认 250）。
+     */
+    fun realtimeLatency(
+        audioType: String,
+        streamType: Long,
+        floorMs: Long = AUDIO_LATENCY_REALTIME_FLOOR_MS,
+    ): Long = latencyFor(negotiatedInfo ?: emptyMap<String, Any>(), audioType, streamType, floorMs)
 
     /**
      * 车机身份文本（音频档位记忆的键来源）：只用 /info 里稳定的 model + manufacturer，
