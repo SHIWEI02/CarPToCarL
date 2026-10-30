@@ -1605,7 +1605,16 @@ object SessionController {
         return try {
             val prefs = context.getSharedPreferences("settings", android.content.Context.MODE_PRIVATE)
             // RTP 冗余级数：settings.audio_rtp_redundancy（0=关，1..7=级数）。见 AudioSender。
-            val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 1).coerceIn(0, 7)
+            //
+            // **默认 0**（2026-10-30 回滚 428430c 的「默认开」）：MacPlay 类接收端并不按
+            // RFC 2198 丢弃冗余块，而是把整包（冗余帧 + 主帧）都解码后推入播放管线。
+            // 一包带两帧、RTP 时间戳却只推进一帧 → 每包净积压一帧 → 播放点线性后退，
+            // 实测 30s 会话 playoutLead=-3.4s、120s 掉到 -48.5s、180s 到 -76s，
+            // lateBuffers 达 97%，听感就是「越来越滞后 + 卡顿」。
+            // 真机日志：/Users/shiwei/Library/Application Support/MacPlay/MacPlay.log
+            // 若将来要开，必须先确认目标接收端的 audio-statistics 里
+            // decodedBuffers ≈ packets（而不是 2× packets）。
+            val rtpRedundancy = prefs.getInt("audio_rtp_redundancy", 0).coerceIn(0, 7)
             // 车机身份 → 只用于「本车机哪些音频档位踩过雷」的持久化记忆。
             val identity = client.receiverIdentity()
             // 音频封装参数已定案（见 AudioTuning），不再提供切换
