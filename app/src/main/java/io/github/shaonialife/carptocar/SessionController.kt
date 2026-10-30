@@ -330,13 +330,14 @@ object SessionController {
     private const val PROGRESS_PUSH_INTERVAL_MS = 5_000L
 
     /**
-     * 可进缓存的封面最小字节数。
+     * 可采用的封面最小字节数。
      *
      * 本机 CarLife 的占位图是 4363B（偶尔 2817B），真封面实测都在 17~30KB。
-     * 占位图照常推给车机（总比空白好），但不缓存——否则切回这首歌会立刻显示
-     * 那张占位图，而不是等真图。
+     * 低于此门槛直接当作「没有封面」：既不推给车机，也不进缓存。
+     * 早期版本会把它推出去（灰底图），实测一旦出现灰图，随后就会跟着出现
+     * 别的曲目的错图——因为灰图先把曲目绑定占住，真图到达前的时间窗被脏数据填满。
      */
-    private const val ARTWORK_CACHE_MIN_BYTES = 8_000
+    private const val ARTWORK_MIN_BYTES = 8_000
 
     /**
      * 歌名变化：同时补推 WiFi 隧道（currentClient）与蓝牙链路（server/client）。
@@ -371,7 +372,11 @@ object SessionController {
         // 的精确判据后不再需要它。
         val raw =
             info?.albumArt?.takeIf {
-                it.isNotEmpty() && !info.partial && pid != null
+                // 小于门槛的是 CarLife 的占位图（4363B，偶尔 2817B），一出现就是一张
+                // 灰底图。实测它一旦被推出去，紧接着就会跟来一串错图（18:50:03 推了
+                // 4363B，6.7s 后同一曲目又被塞进另一首的 18385B）。宁可短暂空白，
+                // 也不要灰图——真封面实测都在 17~30KB。
+                it.size >= ARTWORK_MIN_BYTES && !info.partial && pid != null
             }
         val rawHash = raw?.contentHashCode() ?: 0
         // 记录「上一个曲目最后一张图」。切歌时 CarLife 会把这张图再发一遍。
@@ -405,16 +410,16 @@ object SessionController {
                     (owner != null && owner != pid) ||
                         (prevRawArtHash != 0 && rawHash == prevRawArtHash && artworkTrackId != pid)
                 )
-        // 同一张专辑内不同曲目合法共用同一张图（此时两张图本来就一样，不会显示错）。
-        val ownerAlbum = owner?.let { pidAlbums[it] }
-        val sameAlbum =
-            !sameTrack && art != null &&
-                pid != null && info?.album?.isNotBlank() == true && info?.album == ownerAlbum
+        // 归属优先：只要这张图已经属于别的曲目，一律不采用。
+        // 早期放了「同专辑可共用」的例外，实测被脏数据钻空——CarLife 的 album 字段
+        // 在切歌时会短暂沿用上一首，于是"同专辑"成立、别人的图被收下
+        // （18:50:06 同一张 18385B 在 42ms 内被推给了两个曲目）。
+        // 代价是同专辑真共用一张图时，后一首会没有封面——比显示错图可接受。
         val needUpload =
             when {
                 art == null -> false
                 cached != null -> true // 缓存命中的图必然属于该曲目
-                foreign && !sameAlbum -> false // 别人的图，除非同专辑合法共用
+                foreign -> false
                 sameTrack -> artHash != artworkHash
                 else -> true
             }
@@ -431,7 +436,6 @@ object SessionController {
             artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
             artworkTrackId = pid
             artworkHash = artHash
-            artworkAlbum = info?.album.orEmpty()
         }
         if (!force && !needUpload && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
@@ -449,10 +453,8 @@ object SessionController {
                 // 只缓存「真图」。CarLife 有个 4363B（偶尔 2817B）的占位图，会在
                 // 切歌瞬间或它还没取到封面时冒出来；若把它存进缓存，下次切回这首歌
                 // 就会立刻显示那张占位图（实测 18:44:06「缓存 4363B」）。
-                if (art.size >= ARTWORK_CACHE_MIN_BYTES) artworkCache[pid] = art
+                artworkCache[pid] = art
                 artworkOwners[artHash] = pid
-                val album = info?.album.orEmpty()
-                if (album.isNotBlank()) pidAlbums[pid] = album
             }
             appendLog(
                 "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid" +
@@ -507,17 +509,8 @@ object SessionController {
             override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Long>?) = size > 32
         }
 
-    /** 曲目 id → 专辑名（判定"同专辑共用一张图"用，与 [artworkOwners] 配套）。 */
-    private val pidAlbums =
-        object : LinkedHashMap<Long, String>(32, 0.75f, true) {
-            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, String>?) = size > 32
-        }
-
     /** 上次成功发出封面所属的**曲目持久 id**（不是歌名——过渡帧的歌名不可靠）。 */
     private var artworkTrackId: Long? = null
-
-    /** 最近一次成功发出封面所属的专辑名（同专辑内允许复用同一张图）。 */
-    private var artworkAlbum: String = ""
 
     /**
      * 曲目 → 封面缓存（最近 16 首，LRU）。
@@ -560,7 +553,6 @@ object SessionController {
         // 所以不再补传，但 0x5001 仍在宣告 artwork_ftid，接收端有 id 无文件。
         artworkHash = 0
         artworkTrackId = null
-        artworkAlbum = ""
         lastSeenPid = null
         lastSeenArtHash = 0
         prevRawArtHash = 0
