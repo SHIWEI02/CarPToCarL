@@ -682,7 +682,14 @@ class Iap2LinkEngine(
                 CONTROL_ACKNOWLEDGEMENT,
                 if (packet.sessionId != 0) packet.sessionId else controlSessionId(),
             )
-            if (!packet.awaitAck) continue // 发后不管：不追踪、不重传（见 sendControl 注释）
+            if (!packet.awaitAck) {
+                // 发后不管：不追踪、不重传。但**必须同时推进发送窗口**——否则这些包
+                // 占着「已发未确认」的额度，连发一批（如封面 30 个分片）就会把窗口占满，
+                // 后续分片留在 backlog 里永远发不出去，接收端只能拿到残缺文件。
+                // 这类包按定义不要求确认，视作已确认即可。
+                lastSentAcknowledged = sentSequence
+                continue
+            }
             if (peer == null || peer.maxRetransmissions > 0) {
                 unacknowledged += packet
                 retransmitDeadline = packet.deadlineMillis
