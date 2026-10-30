@@ -192,6 +192,20 @@ class CarLifeHuClient(
     @Volatile
     private var audioKickCount = 0
 
+    /** 音频通道累计重连次数（日志限流用）。 */
+    @Volatile
+    private var audioReconnectCount = 0
+
+    /**
+     * 媒体/TTS 通道的「代数」。
+     *
+     * 每次开一条新通道就 +1；读线程退出时只在**自己仍是当前代数**时才置 dead 标记。
+     * 没有这个保护会出现：看门狗重连并置 `dead=false` 后，旧读线程的 finally 才慢一步
+     * 执行，又把 `dead` 翻回 true，于是下一轮再重连——新旧通道来回 ping-pong。
+     */
+    private val mediaGen = java.util.concurrent.atomic.AtomicInteger(0)
+    private val ttsGen = java.util.concurrent.atomic.AtomicInteger(0)
+
     /** 已收到的 TTS/导航播报音频包数（诊断用；媒体侧用 [audioPacketCount]）。 */
     @Volatile
     private var ttsPacketCount: Long = 0
@@ -313,6 +327,7 @@ class CarLifeHuClient(
         mediaDead = false
         ttsDead = false
         audioKickCount = 0
+        audioReconnectCount = 0
         lastMediaAudioAt = 0L
         lastMediaProgressAt = 0L
         silentWarned.clear()
@@ -320,20 +335,39 @@ class CarLifeHuClient(
 
         startReader("carlife-cmd") { cmdReader(cmd.getInputStream()) }
         sockets[CarLifeProtocol.PORT_VIDEO]?.let { video ->
-            startReader("carlife-video") { videoReader(video.getInputStream()) }
+            startReader("carlife-video") {
+                // 外层 finally 兜住 getInputStream() 抛异常的情形，否则 videoDead 不会置位，
+                // 看门狗只当成「出帧慢」，不会重连。
+                try {
+                    videoReader(video.getInputStream())
+                } finally {
+                    videoDead = true
+                }
+            }
         }
         sockets[CarLifeProtocol.PORT_MEDIA]?.let { media ->
             mediaChannelSince = android.os.SystemClock.uptimeMillis()
             mediaPacketBaseline = audioPacketCount
+            val gen = mediaGen.incrementAndGet()
             startReader("carlife-media") {
-                audioReader(media.getInputStream(), "媒体")
+                try {
+                    audioReader(media.getInputStream(), "媒体")
+                } finally {
+                    // 只有「仍是当前代」的读线程才有权判死，避免旧线程翻掉新通道的状态。
+                    if (mediaGen.get() == gen) mediaDead = true
+                }
             }
         }
         sockets[CarLifeProtocol.PORT_TTS]?.let { tts ->
             ttsChannelSince = android.os.SystemClock.uptimeMillis()
             ttsPacketBaseline = ttsPacketCount
+            val gen = ttsGen.incrementAndGet()
             startReader("carlife-tts") {
-                audioReader(tts.getInputStream(), "TTS", isTts = true)
+                try {
+                    audioReader(tts.getInputStream(), "TTS", isTts = true)
+                } finally {
+                    if (ttsGen.get() == gen) ttsDead = true
+                }
             }
         }
         startReader("carlife-heartbeat") { heartbeatLoop() }
@@ -932,10 +966,27 @@ class CarLifeHuClient(
                 mediaChannelSince = now
                 mediaPacketBaseline = audioPacketCount
             }
+            val gen = if (isTts) ttsGen.incrementAndGet() else mediaGen.incrementAndGet()
             startReader(if (isTts) "carlife-tts" else "carlife-media") {
-                audioReader(socket.getInputStream(), label, isTts = isTts)
+                // 外层 try/finally 是必需的：若 getInputStream() 本身抛异常（连接刚建立
+                // 就被引擎关掉时会这样），audioReader 根本进不去，它内部的 finally 也就
+                // 不会执行，dead 标记会一直是 false。看门狗随后看到「socket 存在且未
+                // 关闭」判定健康，永不重连——又变成永久静音。
+                try {
+                    audioReader(socket.getInputStream(), label, isTts = isTts)
+                } finally {
+                    if (isTts) {
+                        if (ttsGen.get() == gen) ttsDead = true
+                    } else if (mediaGen.get() == gen) {
+                        mediaDead = true
+                    }
+                }
             }
-            log("CARLIFE: $label 音频通道已重连（端口 $port，等待引擎推流）")
+            audioReconnectCount++
+            // 引擎连续 reset 时每 1s 都会走到这里，限流避免刷屏（沿用视频看门狗的 1/10 规则）。
+            if (audioReconnectCount == 1 || audioReconnectCount % 10 == 0) {
+                log("CARLIFE: $label 音频通道已重连（端口 $port，累计 $audioReconnectCount 次）")
+            }
             true
         } catch (error: Exception) {
             runCatching { socket.close() }
@@ -1219,11 +1270,9 @@ class CarLifeHuClient(
             }
         } catch (error: Exception) {
             if (running.get()) log("CARLIFE: $label 音频通道断开 - ${error.message}")
-        } finally {
-            // 无论 EOF、reset 还是长度异常提前 return，这条 socket 都已不可用，
-            // 必须交给 audioSupervisor 重连——否则视频有声、音频永久静音。
-            if (isTts) ttsDead = true else mediaDead = true
         }
+        // 判死标记不在这里置位：由调用方（start / reopenAudio）的外层 finally 带代数校验
+        // 统一处理，避免旧读线程晚一步执行把新通道的状态翻掉。
     }
 
     /** 解析 CarlifeMusicInit：field1 sampleRate / field2 channelConfig / field3 sampleFormat。 */
