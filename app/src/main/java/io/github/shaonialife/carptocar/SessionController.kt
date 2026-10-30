@@ -375,11 +375,17 @@ object SessionController {
         val cached = if (pid != null && !sameTrack) artworkCache[pid] else null
         val art = cached ?: raw
         val artHash = art?.contentHashCode() ?: 0
-        // 「沿用上一首的图」= 与最近一次成功发出的图字节完全相同，且不是本曲目。
-        val carryOver = cached == null && !sameTrack && artworkTrackId != null && artHash == artworkHash
+        // 「这张图已经属于别的曲目」→ CarLife 把旧图塞进了新曲目的帧。
+        // 必须按**图本身的归属**判断，不能只跟最近一次推送比：连续快切时它会同时
+        // 掺进更早曲目的图（实测 18:32:58 把《我好想你》的 27274B 塞给《Dance Monkey》，
+        // 而当时最近一次推送是 4363B 占位图，因此漏判 → 显示中间那首的封面）。
+        val owner = artworkOwners[artHash]
+        val carryOver = cached == null && !sameTrack && owner != null && pid != null && owner != pid
+        // 同一张专辑内不同曲目合法共用同一张图（此时两张图本来就一样，不会显示错）。
+        val ownerAlbum = owner?.let { pidAlbums[it] }
         val sameAlbum =
             !sameTrack && art != null &&
-                !info?.album.isNullOrBlank() && info?.album == artworkAlbum
+                pid != null && info?.album?.isNotBlank() == true && info?.album == ownerAlbum
         val needUpload =
             when {
                 art == null -> false
@@ -388,7 +394,9 @@ object SessionController {
             }
         if (art != null && !needUpload && carryOver && lastSkipLoggedPid != pid) {
             lastSkipLoggedPid = pid
-            appendLog("EVENT: 跳过封面 ${art.size}B（与上一首完全相同，判定为未刷新的旧图）")
+            appendLog(
+                "EVENT: 跳过封面 ${art.size}B（该图已归属曲目 $owner，判定为旧图未刷新）",
+            )
         }
         // 先把「新 ftid 已绑定到本曲目」记下来，再推 0x5001：各条链路发送时会重新
         // 调用 buildNowPlaying()（见 nowPlayingProvider），只有 artworkTrackId 已指向
@@ -413,6 +421,9 @@ object SessionController {
                 artworkHash = 0
             } else if (pid != null) {
                 artworkCache[pid] = art
+                artworkOwners[artHash] = pid
+                val album = info?.album.orEmpty()
+                if (album.isNotBlank()) pidAlbums[pid] = album
             }
             appendLog(
                 "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid" +
@@ -454,6 +465,24 @@ object SessionController {
 
     /** 最近一次成功发出的封面内容哈希（配合 [artworkTrackId] 判定「是不是旧图」）。 */
     private var artworkHash = 0
+
+    /**
+     * 封面内容哈希 → 它已归属的曲目 id（LRU 32）。
+     *
+     * CarLife 在快速连续切歌时会把**更早曲目的封面**掺进新曲目的 0x10035 帧里，
+     * 且未必是紧邻的上一首。只跟"最近一次推送"比会漏判，必须记住每张图属于谁。
+     * 同一张图被判定属于 A 之后，再出现在 B 的帧里就一定是旧图。
+     */
+    private val artworkOwners =
+        object : LinkedHashMap<Int, Long>(32, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, Long>?) = size > 32
+        }
+
+    /** 曲目 id → 专辑名（判定"同专辑共用一张图"用，与 [artworkOwners] 配套）。 */
+    private val pidAlbums =
+        object : LinkedHashMap<Long, String>(32, 0.75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Long, String>?) = size > 32
+        }
 
     /** 上次成功发出封面所属的**曲目持久 id**（不是歌名——过渡帧的歌名不可靠）。 */
     private var artworkTrackId: Long? = null
