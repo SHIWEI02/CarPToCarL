@@ -872,7 +872,7 @@ class Iap2SenderSession(
             log(
                 "iap2 $tag 0x5001（歌名=${np.title ?: "?"} 歌手=${np.artist ?: "?"} " +
                     "专辑=${np.album ?: "?"} 进度=${np.elapsedMs}/${np.durationMs}ms " +
-                    "状态=${np.status}）",
+                    "状态=${np.status} 曲目=${np.persistentId ?: "-"} 封面ftid=${np.artworkFtid ?: "-"}）",
             )
         }.onFailure {
             log("iap2 0x5001 发送失败（$tag）- ${it.message}")

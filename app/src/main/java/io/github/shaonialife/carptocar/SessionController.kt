@@ -339,21 +339,55 @@ object SessionController {
      */
     private fun pushNowPlayingAll(force: Boolean = false) {
         var np = buildNowPlaying() ?: return
+        val info = CarLifeHijack.latestMediaInfo
+        val pid = np.persistentId
         val key = "${np.title}|${np.artist}"
-        // 封面：内容变了才换 ftid（否则每次 5s 进度补推都重发 20KB）。
-        // 0x5001 里只带 ftid，JPEG 走 file-transfer 会话，两者必须成对更新。
+
+        // 过渡帧一律跳过（除非本次会话还没推过任何东西，避免引擎字段不全时整场空白）。
+        // CarLife 切歌瞬间会先推一条 field 3 只有歌手的帧，它携带的封面仍是上一首的。
+        // 只对 CarLife 源生效（MediaSession 兜底路径 persistentId 为 null）。
+        if (info?.partial == true && pid != null && lastPushedNowPlayingKey != null) return
+
+        // 封面按「曲目 + ftid」双键绑定：接收端（MacPlay NowPlayingState）用
+        // coverKey(id, trackID) 存图，换曲目后同一个 ftid 在新曲目下查不到图。
+        // 所以换曲目时一律换新 ftid，即使图片字节相同也要重发一次。
         //
-        // 同一首歌内只接受**更大**的图：CarLife 对同一首歌会先后推多张
-        // （实测 26463B 高清 → 2817B 低清占位，顺序不固定）。按「变化即换」
-        // 会把封面降级成糊图，还白传一次。
-        val art = CarLifeHijack.latestMediaInfo?.albumArt?.takeIf { it.isNotEmpty() }
-        val sameTrack = key == lastArtworkKey
+        // 但**不能见到图就发**：实测 18:11:18 切歌时，CarLife 先推两条仍带**上一首封面**
+        // 的帧（25675B，《因为爱情》），0.5s 后才推真正的 27274B。照单全收就会把旧封面
+        // 挂到新曲目上——「切歌后封面还是之前的」。
+        //
+        // 判据：换曲目后，图片必须与上一首**不同**才发；字节相同则视为「尚未刷新」。
+        // 例外：同一张专辑内不同曲目合法共用一张图，此时允许复用（换新 ftid 重发）。
+        val art =
+            info?.albumArt?.takeIf {
+                it.isNotEmpty() && !info.partial && pid != null
+            }
+        val hashDiffers = art != null && art.contentHashCode() != lastArtworkHash
+        val sameTrack = pid != null && artworkTrackId == pid
+        val sameAlbum =
+            !sameTrack && art != null &&
+                !info?.album.isNullOrBlank() && info?.album == lastArtworkAlbum
         val artChanged =
-            art != null &&
-                art.contentHashCode() != lastArtworkHash &&
-                (!sameTrack || art.size > lastArtworkSize)
+            when {
+                art == null -> false
+                sameTrack -> hashDiffers && art.size > lastArtworkSize // 同曲目：只接受更大的
+                else -> hashDiffers || sameAlbum // 换曲目：新图，或同专辑合法共用
+            }
+        if (art != null && !artChanged && !sameTrack && !hashDiffers && lastSkipLoggedPid != pid) {
+            lastSkipLoggedPid = pid
+            appendLog("EVENT: 跳过封面 ${art.size}B（与上一首完全相同，判定为未刷新的旧图）")
+        }
         if (artChanged) artworkFtid = if (artworkFtid >= 250) 1 else artworkFtid + 1
-        if (art != null && artworkFtid > 0) np = np.copy(artworkFtid = artworkFtid)
+        // 只宣告「属于当前曲目」的 ftid：换曲目后若还没拿到新图，宁可不宣告
+        // （接收端换曲目时自己会清空封面），也不能宣告上一首的 id——那会让
+        // 车机保留上一首的封面（「切歌后封面还是之前的」）。
+        val advertised =
+            when {
+                artChanged -> artworkFtid
+                sameTrack -> artworkFtid
+                else -> null
+            }
+        if (advertised != null) np = np.copy(artworkFtid = advertised)
         if (!force && !artChanged && key == lastPushedNowPlayingKey) return
         lastPushedNowPlayingKey = key
         currentClient?.pushNowPlaying()
@@ -366,10 +400,11 @@ object SessionController {
             if (ok) {
                 lastArtworkHash = art.contentHashCode()
                 lastArtworkSize = art.size
-                lastArtworkKey = key
+                artworkTrackId = pid
+                lastArtworkAlbum = info?.album.orEmpty()
             }
             appendLog(
-                "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B → " +
+                "EVENT: 推送封面 ftid=$artworkFtid ${art.size}B 曲目=$pid → " +
                     (if (ok) "已发出" else "无隧道链路/失败（下次补推）"),
             )
         }
@@ -384,8 +419,14 @@ object SessionController {
     /** 上次成功发出封面的字节数（同一首歌内只接受更大的图）。 */
     private var lastArtworkSize = 0
 
-    /** 上次成功发出封面所属的曲目键（title|artist）。 */
-    private var lastArtworkKey: String? = null
+    /** 上次成功发出封面所属的**曲目持久 id**（不是歌名——过渡帧的歌名不可靠）。 */
+    private var artworkTrackId: Long? = null
+
+    /** 上次成功发出封面所属的专辑名（同专辑内允许复用同一张图）。 */
+    private var lastArtworkAlbum: String = ""
+
+    /** 已就「跳过旧封面」打过日志的曲目，避免每个进度周期刷屏。 */
+    private var lastSkipLoggedPid: Long? = null
 
     /** 上次推送的 0x5001 内容键（title|artist），用于去重。 */
     private var lastPushedNowPlayingKey: String? = null
@@ -404,8 +445,10 @@ object SessionController {
         // 不清这两个键会导致「重连后同一首歌封面一直空白」——artChanged 恒为 false
         // 所以不再补传，但 0x5001 仍在宣告 artwork_ftid，接收端有 id 无文件。
         lastArtworkHash = 0
-        lastArtworkKey = null
         lastArtworkSize = 0
+        artworkTrackId = null
+        lastArtworkAlbum = ""
+        lastSkipLoggedPid = null
     }
 
     /**
@@ -447,7 +490,7 @@ object SessionController {
                 // 接收端靠它把封面绑到曲目上，缺了就「收到图但挂不上」。
                 persistentId =
                     carlifeInfo.songId.toLongOrNull()
-                        ?: (carlifeInfo.song.hashCode().toLong() and 0xFFFF_FFFFL),
+                        ?: (carlifeInfo.song.trim().hashCode().toLong() and 0xFFFF_FFFFL),
             )
         }
         // 劫持在跑 = 手机音频走 CarLife，此时 MediaSession 只是同一首歌的**更差副本**

@@ -723,4 +723,19 @@ data class CarLifeMediaInfo(
     val mode: Int,
     /** 当前歌词行（field 2，逐行刷新；iAP2 0x5001 暂无字段可承载，仅留存）。 */
     val lyric: String = "",
-)
+) {
+    /**
+     * 是否为「过渡帧」——切歌瞬间 CarLife 会先推一条字段不全的报文。
+     *
+     * 实测（2026-10-30 18:11:18，从《因为爱情》切到《我好想你》）：
+     *   song=苏打绿            artist=(空)  art=25675B  lyric=我好想你 (苏打绿版)
+     *   song=我好想你 (苏打绿版) artist=苏打绿 art=27274B  lyric=… - 苏打绿     ← 0.5s 后
+     *
+     * 第一帧的 field 3 只有歌手、没有「歌名-歌手」合并串，于是 song 被填成歌手名；
+     * 更关键的是它携带的**封面仍是上一首的**。用这种帧推 0x5001 会让车机显示错的
+     * 歌名，并把旧封面挂到新曲目上。
+     *
+     * 判据取 `artist` 为空：正常帧的 field 3 一定含 '-'（歌名-歌手），拆分后不为空。
+     */
+    val partial: Boolean get() = artist.isBlank()
+}
