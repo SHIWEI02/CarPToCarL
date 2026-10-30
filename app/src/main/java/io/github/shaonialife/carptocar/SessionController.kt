@@ -238,6 +238,79 @@ object SessionController {
                 pushNowPlayingAll(force = true)
             }
         }
+        // 数据源 D（反向）：车机拖动进度条 / 暂停 → 手机播放器真的跳转/暂停。
+        // 车机发的是 0x5002 SetNowPlayingInformation，本仓此前完全没接（收到都不记），
+        // 表现为「进度条能拖、松手弹回原处」。
+        Iap2NowPlaying.playbackCommandSink = { cmd ->
+            cmd.elapsedMs?.let { ms ->
+                val ok = MediaSessionsState.seekTo(ms.toLong())
+                appendLog(
+                    "EVENT: 车机拖动进度 → seek ${ms}ms（" +
+                        (if (ok) "已投递到当前媒体会话" else "无可用媒体会话") + "）",
+                )
+            }
+            // 只带 status 时才切播放态；带 elapsed 的是拖动，别顺手暂停/播放。
+            if (cmd.elapsedMs == null) {
+                when (cmd.status) {
+                    Iap2NowPlaying.STATUS_PLAYING ->
+                        MediaSessionsState.setPlaybackActive(true)
+
+                    Iap2NowPlaying.STATUS_STOPPED, Iap2NowPlaying.STATUS_PAUSED ->
+                        MediaSessionsState.setPlaybackActive(false)
+                }
+            }
+        }
+        installDebugSeekReceiver()
+    }
+
+    /** 调试注入入口是否已注册（只注册一次）。 */
+    private var debugSeekReceiverInstalled = false
+
+    /**
+     * 调试：注册一个 adb 可触发的广播，用来**模拟车机拖动进度条**。
+     *
+     * 走的是与真实 0x5002 完全相同的路径（同一个 buildPlaybackCommand → 同一个
+     * parsePlaybackCommand → 同一个 playbackCommandSink），因此验证通过的落点
+     * 在真车机上也成立；唯一的差别是这帧不经过 iAP2 链路。
+     *
+     *   adb shell am broadcast -a io.github.shaonialife.carptocar.DEBUG_SEEK --ei ms 60000
+     *
+     * 仅在 debug 包启用，release 不注册。
+     */
+    private fun installDebugSeekReceiver() {
+        if (debugSeekReceiverInstalled) return
+        if (!BuildConfig.DEBUG) return
+        val ctx = appContext ?: return
+        debugSeekReceiverInstalled = true
+        runCatching {
+            androidx.core.content.ContextCompat.registerReceiver(
+                ctx,
+                object : android.content.BroadcastReceiver() {
+                    override fun onReceive(
+                        receiverContext: android.content.Context?,
+                        intent: android.content.Intent?,
+                    ) {
+                        val ms = intent?.getIntExtra("ms", -1) ?: -1
+                        if (ms >= 0) simulateRemoteSeek(ms)
+                    }
+                },
+                android.content.IntentFilter("io.github.shaonialife.carptocar.DEBUG_SEEK"),
+                androidx.core.content.ContextCompat.RECEIVER_EXPORTED,
+            )
+        }.onFailure {
+            appendLog("DEBUG: 拖动注入入口注册失败 - ${it.message}")
+        }
+    }
+
+    /** 模拟一条车机下发的 0x5002（拖动到 [elapsedMs]）。 */
+    fun simulateRemoteSeek(elapsedMs: Int) {
+        val body = Iap2NowPlaying.buildPlaybackCommand(Iap2NowPlaying.STATUS_PLAYING, elapsedMs)
+        val cmd = Iap2NowPlaying.parsePlaybackCommand(body)
+        appendLog(
+            "DEBUG: 模拟车机拖动进度 → 请求 ${elapsedMs}ms，" +
+                "解析=${cmd?.elapsedMs ?: "失败"}ms（${body.size}B）",
+        )
+        if (cmd != null) Iap2NowPlaying.playbackCommandSink?.invoke(cmd)
     }
 
     /** 上次因进度变化补推 0x5001 的时刻（elapsedRealtime）。 */

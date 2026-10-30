@@ -60,6 +60,17 @@ object Iap2MessageIds {
     // ---- 配件 bring-up 期间发来的订阅请求（接收并忽略即可）----
     const val START_NOW_PLAYING_UPDATES = 0x5000
     const val NOW_PLAYING_UPDATE = 0x5001
+
+    /**
+     * 车机 → 手机：设置正在播放（播放/暂停/拖动进度）。
+     *
+     * 这个号不在 Apple 公开消息表里（本仓 0x1d01 解析时就把它列为「陌生 ID」），
+     * 但车机（含 MacPlay）的**发送清单**里明确包含它，且与 0x5001 的 playback 组同构：
+     * 顶层 param 0x0001 下挂 0x0000 status / 0x0001 elapsed。
+     * 解析实现见 [Iap2NowPlaying.parsePlaybackCommand]，真机报文体与假设不符时
+     * VirtualIap2Link 会把原始 hex 打进日志，据实修正即可。
+     */
+    const val SET_NOW_PLAYING_INFORMATION = 0x5002
     const val START_ROUTE_GUIDANCE_UPDATES = 0x5200
     const val START_POWER_UPDATES = 0xAE00
     const val START_COMMUNICATIONS_UPDATES = 0x4157
@@ -90,6 +101,7 @@ object Iap2MessageIds {
             EA_CLOSE_SESSION -> "StopEASession"
             EA_SESSION_STATUS -> "EASessionStatus"
             START_NOW_PLAYING_UPDATES -> "StartNowPlayingUpdates"
+            SET_NOW_PLAYING_INFORMATION -> "SetNowPlayingInformation"
             NOW_PLAYING_UPDATE -> "NowPlayingUpdate"
             START_ROUTE_GUIDANCE_UPDATES -> "StartRouteGuidanceUpdates"
             START_POWER_UPDATES -> "StartPowerUpdates"

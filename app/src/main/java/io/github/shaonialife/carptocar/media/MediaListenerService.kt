@@ -308,6 +308,29 @@ object MediaSessionsState {
         }.getOrDefault(false)
     }
 
+    /**
+     * 车机拖动进度条 → 手机播放器跳转。
+     *
+     * CarPlay 车机（含 MacPlay）拖进度条时不会改自己的播放点，而是发 0x5002 要求手机
+     * 跳转；手机不响应时表现为「进度条能拖、松手又弹回原处」。返回 true = 已投递。
+     */
+    fun seekTo(positionMs: Long): Boolean {
+        val controls = activeController?.transportControls ?: return false
+        return runCatching {
+            controls.seekTo(positionMs.coerceAtLeast(0L))
+            true
+        }.getOrDefault(false)
+    }
+
+    /** 车机下发的播放/暂停（0x5002 的 status 字段）。返回 true = 已投递。 */
+    fun setPlaybackActive(playing: Boolean): Boolean {
+        val controls = activeController?.transportControls ?: return false
+        return runCatching {
+            if (playing) controls.play() else controls.pause()
+            true
+        }.getOrDefault(false)
+    }
+
     /** 供 SessionController 把 Android 键码映射成这里能处理的动作。 */
     fun transportActionFor(keyCode: Int): Int =
         when (keyCode) {

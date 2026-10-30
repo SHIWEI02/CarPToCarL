@@ -695,6 +695,25 @@ class VirtualIap2Link(
                 fireHidKeysLocked(usages)
             }
 
+            ids.SET_NOW_PLAYING_INFORMATION -> {
+                // 车机拖动进度条/暂停时下发。不处理的表现是「能拖、松手弹回」。
+                // 本仓此前完全没接这条：收到也不记，等于车机操作被静默丢弃。
+                val cmd = Iap2NowPlaying.parsePlaybackCommand(frame.body)
+                log(
+                    "IAPLINK: 车机 0x5002 SetNowPlaying ${frame.body.size}B hex=" +
+                        frame.body.joinToString(" ") { "%02x".format(it) } +
+                        " → " +
+                        (
+                            cmd?.let { c ->
+                                "status=${c.status ?: "-"} " +
+                                    "elapsed=${c.elapsedMs?.let { it.toString() + "ms" } ?: "-"} " +
+                                    "shuffle=${c.shuffleMode ?: "-"} repeat=${c.repeatMode ?: "-"}"
+                            } ?: "解析不出字段"
+                        ),
+                )
+                if (cmd != null) Iap2NowPlaying.playbackCommandSink?.invoke(cmd)
+            }
+
             else -> {
                 // 未处理的消息也留痕：车机若用非常规 ID 下发媒体键/按键，这里能第一时间
                 // 在日志里看到对应消息号（切歌按键排查的关键观测点）。
