@@ -151,6 +151,7 @@ class MediaListenerService : NotificationListenerService() {
                     playing = playing,
                     art = artFor(controller, meta, title),
                     pkg = controller.packageName,
+                    album = meta?.getString(MediaMetadata.METADATA_KEY_ALBUM),
                     positionMs = state?.position ?: 0L,
                     playbackSpeed = if (playing) (state?.playbackSpeed ?: 1f) else 0f,
                     durationMs = meta?.getLong(MediaMetadata.METADATA_KEY_DURATION) ?: 0L,
@@ -239,6 +240,15 @@ object MediaSessionsState {
         val durationMs: Long = 0L,
         /** 位置采样的 SystemClock.elapsedRealtime 锚点。 */
         val anchoredAtMs: Long = 0L,
+        /**
+         * 专辑名（METADATA_KEY_ALBUM）。
+         *
+         * 此前没有这个字段，导致 buildNowPlaying() 走 MediaSession 分支时专辑被硬编码成
+         * null——实测 0x5001 的 album 参数长度恒为 0，而 CarLife 0x10035 侧是有专辑的
+         * （「秘密警察」），数据在中间链路被丢掉。部分播放器（含 QQ音乐）MediaSession
+         * 不填专辑，调用方会用 CarLife 侧兜底。
+         */
+        val album: String? = null,
     ) {
         /** 渲染时刻的推算播放位置（播放中按速度外推，钳制在时长内）。 */
         fun displayPositionAt(elapsedRealtimeMs: Long): Long {

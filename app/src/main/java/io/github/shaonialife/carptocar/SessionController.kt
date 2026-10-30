@@ -270,12 +270,16 @@ object SessionController {
      * 读不到再退回 CarLife 0x10035 推来的媒体信息；两者皆无返回 null（不响应）。
      */
     private fun buildNowPlaying(): CarPlayNowPlaying? {
+        val carlifeInfo = CarLifeHijack.latestMediaInfo
         val session = MediaSessionsState.nowPlaying
         if (session != null && session.title != null) {
             return CarPlayNowPlaying(
                 title = session.title,
                 artist = session.artist,
-                album = null, // MediaSession 未单独暴露专辑名，这里留空
+                // 部分播放器（含 QQ音乐）MediaSession 不填专辑；此时用 CarLife 0x10035
+                // 解析出的专辑兜底——否则 0x5001 的 album 恒为空。
+                album = session.album?.takeIf { it.isNotBlank() }
+                    ?: carlifeInfo?.album?.takeIf { it.isNotBlank() },
                 durationMs = session.durationMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
                 status =
                     if (session.playing) {
@@ -296,7 +300,9 @@ object SessionController {
             title = info.song.takeIf { it.isNotBlank() },
             artist = info.artist.takeIf { it.isNotBlank() },
             album = info.album.takeIf { it.isNotBlank() },
-            durationMs = info.duration,
+            // CarLife 0x10035 的 duration 单位是**秒**（实测 QQ音乐 204 = 3:24），
+            // 旧代码直接当毫秒用，4 分钟的歌在车机上显示成 204ms。
+            durationMs = (info.duration.coerceIn(0, 86_400) * 1000),
             status = Iap2NowPlaying.STATUS_PLAYING, // CarLife 推歌名即视为播放中
             elapsedMs = 0,
             appName = info.source.takeIf { it.isNotBlank() },

@@ -974,9 +974,23 @@ object CarLifeHijack {
         }
     }
 
+    /**
+     * 上一次广播出去的媒体指纹（歌名|歌手|专辑|封面大小）。
+     *
+     * 必须去重：本程序在 98386 里声明了 `MEDIA_LYRIC_SUPPORT=1`，QQ音乐会把**当前歌词行**
+     * 塞进 0x10035 的 field 2 并逐行重推（一首歌两百多条）。若每条都广播，日志会被歌名刷屏，
+     * 而且每条都会触发一次 iAP2 0x5001 全量补推（车机侧跟着重绘 Now Playing）。
+     */
+    @Volatile
+    private var lastMediaFingerprint: String? = null
+
     /** 收到 CarLife 媒体信息（歌名/歌手/封面）：记录并广播，供 iAP2 0x5001 转发。 */
     private fun onMediaInfo(info: CarLifeMediaInfo) {
+        // 无论是否重复都要更新缓存：进度/歌词变化时 latestMediaInfo 仍应是最新的。
         latestMediaInfo = info
+        val fingerprint = "${info.song}|${info.artist}|${info.album}|${info.albumArt?.size ?: 0}"
+        if (fingerprint == lastMediaFingerprint) return
+        lastMediaFingerprint = fingerprint
         mediaInfoListeners.forEach { runCatching { it(info) } }
     }
 

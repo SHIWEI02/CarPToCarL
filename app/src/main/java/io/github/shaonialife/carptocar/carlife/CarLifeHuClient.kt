@@ -238,6 +238,9 @@ class CarLifeHuClient(
     /** 已记录过的未知音频包类型（避免刷屏）。 */
     private val audioUnknownTypes = HashSet<Int>()
 
+    /** 媒体信息原始字段探针已输出的条数（只需前几条即可核对字段语义）。 */
+    private var mediaInfoProbeCount = 0
+
     /** 已记录过的未处理控制消息 id（避免刷屏）。 */
     private val unknownLogged = HashSet<Int>()
 
@@ -648,6 +651,15 @@ class CarLifeHuClient(
 
             CarLifeProtocol.MD_MEDIA_INFO -> {
                 // 手机 CarLife 内置播放器开始播放时主动推送的媒体信息（歌名/歌手/封面）
+                // 探针：前若干条打原始字段视图，用真实报文核对字段语义（歌词/歌名-歌手/时长单位）。
+                if (mediaInfoProbeCount < MEDIA_INFO_PROBE_LIMIT) {
+                    mediaInfoProbeCount++
+                    log(
+                        "CARLIFE: 媒体信息原始（${payload.size}B，" +
+                            "${if (mediaInfoProbeCount == 1) "首条" else "第 $mediaInfoProbeCount 条"}）→ " +
+                            CarLifeProtocol.describeMediaInfo(payload),
+                    )
+                }
                 val infos = CarLifeProtocol.parseMediaInfoList(payload)
                 if (infos.isEmpty()) {
                     log("CARLIFE: 收到媒体信息（${payload.size}B）但解析为空")
@@ -656,8 +668,8 @@ class CarLifeHuClient(
                 infos.forEach { info ->
                     log(
                         "CARLIFE: 媒体信息 song=${info.song} artist=${info.artist} " +
-                            "album=${info.album} dur=${info.duration}ms mode=${info.mode} " +
-                            "art=${info.albumArt?.size ?: 0}B",
+                            "album=${info.album} dur=${info.duration}s mode=${info.mode} " +
+                            "art=${info.albumArt?.size ?: 0}B lyric=${info.lyric.take(20)}",
                     )
                     onMediaInfo(info)
                 }
@@ -1443,6 +1455,9 @@ class CarLifeHuClient(
          * 有过包」，不能按「最近多久没包」判断，否则停车静音时会误报。
          */
         private const val SILENT_WARN_MS = 20_000L
+
+        /** 媒体信息原始字段探针输出条数上限（前几条足够核对映射，之后不再刷）。 */
+        private const val MEDIA_INFO_PROBE_LIMIT = 4
 
         /** 媒体进度多久内算「正在播放」。引擎播放时每秒推一条，留 5s 容错。 */
         private const val MEDIA_PLAYING_WINDOW_MS = 5_000L
