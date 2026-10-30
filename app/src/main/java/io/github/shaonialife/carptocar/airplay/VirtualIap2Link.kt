@@ -171,6 +171,12 @@ class VirtualIap2Link(
             if (started) return
             started = true
             engine.enterNegotiating()
+            // 调试注入：把构造好的 CSM 当作「刚从车机收到」交给同一条分派逻辑。
+            // MacPlay 在 macOS 上拖不动进度条（系统不把 changePlaybackPositionCommand
+            // 投给第三方 App），拿不到真实 0x5003；这条通道让模拟报文走真实分派路径。
+            Iap2NowPlaying.debugCsmInjector = { messageId, body ->
+                maybeRespondControlCsmLocked(Iap2Csm.Frame(messageId, body))
+            }
         }
     }
 

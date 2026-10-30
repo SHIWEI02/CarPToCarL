@@ -305,10 +305,18 @@ object SessionController {
     /** 模拟一条车机下发的 0x5003（拖动到 [elapsedMs]）。 */
     fun simulateRemoteSeek(elapsedMs: Int) {
         val body = Iap2NowPlaying.buildSeekBody(elapsedMs)
+        val injector = Iap2NowPlaying.debugCsmInjector
+        if (injector != null) {
+            // 优先走「车机报文分派」这条真实路径：与真机收到 0x5003 后完全同一个分支。
+            appendLog("DEBUG: 注入车机 0x5003（${body.size}B）→ ${elapsedMs}ms")
+            injector(Iap2MessageIds.SEEK_POSITION, body)
+            return
+        }
+        // 兜底（没有活动 iAP2 链路时）：直接解析 + 落到 sink。
         val cmd = Iap2NowPlaying.parsePlaybackCommand(body)
         appendLog(
             "DEBUG: 模拟车机拖动进度 → 请求 ${elapsedMs}ms，" +
-                "解析=${cmd?.elapsedMs ?: "失败"}ms（${body.size}B）",
+                "解析=${cmd?.elapsedMs ?: "失败"}ms（${body.size}B，无活动链路）",
         )
         if (cmd != null) Iap2NowPlaying.playbackCommandSink?.invoke(cmd)
     }

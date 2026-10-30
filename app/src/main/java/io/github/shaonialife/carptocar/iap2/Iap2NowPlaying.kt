@@ -45,12 +45,21 @@ object Iap2NowPlaying {
     /**
      * 车机下发播放控制的落点（由 SessionController 注册）。
      *
-     * 目前只用于「车机拖动进度条 → 手机播放器 seek」：CarPlay 车机上拖动进度条时，
-     * 车机并不会去改自己的播放点，而是发 0x5002 要求手机跳转——手机不响应时
-     * 表现为「进度条能拖、松手又弹回原处」。
+     * 只用于「车机拖动进度条 → 手机播放器 seek」：车机不会改自己的播放点，
+     * 而是发 0x5003 要求手机跳转——手机不响应时表现为「进度条能拖、松手又弹回原处」。
      */
     @Volatile
     var playbackCommandSink: ((PlaybackCommand) -> Unit)? = null
+
+    /**
+     * 调试用「车机 CSM 注入器」：由 VirtualIap2Link 注册，把一条 CSM 当作刚收到的车机报文
+     * 交给同一条分派逻辑（跳过链路分帧/序号/加密）。
+     *
+     * 存在的意义：MacPlay 在 macOS 上拖不动进度条（系统没把 changePlaybackPositionCommand
+     * 投给第三方 App），拿不到真实 0x5003；用它在协议分派层复现，报文结构与真机一致。
+     */
+    @Volatile
+    var debugCsmInjector: ((messageId: Int, body: ByteArray) -> Unit)? = null
 
     /**
      * 解析 0x5002 参数体。
